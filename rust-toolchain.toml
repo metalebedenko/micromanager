@@ -1,0 +1,7 @@
+# Фиксация Rust-тулчейна под проект (как venv фиксирует версию Python).
+# rustup автоматически возьмёт нужный канал, когда ты в папке проекта.
+# Сам компилятор — юзер-локальный (~/.cargo, ~/.rustup), не системный.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+targets = []

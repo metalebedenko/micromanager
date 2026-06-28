@@ -1,0 +1,22 @@
+/target
+**/*.rs.bk
+*.pdb
+.DS_Store
+
+# audit logs / local runtime state
+/audit/
+*.audit.log
+/.micromanager/
+
+# TUI local state — может содержать API-ключ / историю диалога, НЕ коммитить
+micromanager.config.json
+micromanager.session.json
+
+# Персист pairing — приватный ключ (identity!) + доверия, СТРОГО не коммитить
+micromanager.identity.json
+micromanager.allowlist.json
+micromanager.peers.json
+micromanager.hosts.json
+
+# локальные артефакты редактора / агента
+.claude/
