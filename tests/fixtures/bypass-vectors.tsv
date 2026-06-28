@@ -1,0 +1,91 @@
+# Регресс-таблица safety-байпаса. Колонки: CLASS<TAB>EXPECT<TAB>RAW[<TAB>REASON]
+# CLASS: BASE(всегда Deny) A B C D E (классы фиксов) SAFE(всегда не-Deny)
+# EXPECT: DENY|ASK. RAW: \n \r \t — литералы. REASON: механизм Deny (только для E).
+# Опасные команды и их обёртки, которые hardline-гейт обязан возвращать как Deny.
+BASE	DENY	rm -rf /
+BASE	DENY	rm -rf /etc
+BASE	DENY	dd if=/dev/zero of=/dev/sda
+BASE	DENY	mkfs.ext4 /dev/sda
+BASE	DENY	:(){ :|:& };:
+BASE	DENY	wipefs -a /dev/sda
+BASE	DENY	sh -c 'rm -rf /etc'
+BASE	DENY	rm -rf /*
+A	DENY	\\rm -rf /etc
+A	DENY	'rm' -rf /
+A	DENY	"rm" -rf /etc
+A	DENY	rm'' -rf /etc
+A	DENY	''rm -rf /
+A	DENY	r'm' -rf /etc
+A	DENY	r""m -rf /etc
+A	DENY	rm -rf '/'
+A	DENY	rm -rf "/"
+A	DENY	rm -rf '/etc'
+A	DENY	rm -rf "/etc"
+A	DENY	rm -rf /'etc'
+A	DENY	rm -rf /"etc"
+A	DENY	dd if=/dev/zero of="/dev/sda"
+A	DENY	dd if=/dev/zero "of=/dev/sda"
+A	DENY	"mkfs.ext4" /dev/sda
+A	DENY	"dd" if=/dev/zero of=/dev/sda
+A	DENY	rm -rf "$HOME"
+A	DENY	rm -rf ${HOME}
+A	DENY	rm -rf "$HOME"/*
+A	DENY	"format" c:
+A	DENY	"del" /s /q c:\
+A	DENY	"rd" /s /q c:\
+A	DENY	del /s /q "c:\"
+B	DENY	sudo rm -rf /
+B	DENY	sudo rm -rf /etc
+B	DENY	doas rm -rf /etc
+B	DENY	env rm -rf /etc
+B	DENY	env FOO=bar rm -rf /
+B	DENY	nice rm -rf /etc
+B	DENY	ionice -c3 rm -rf /etc
+B	DENY	timeout 5 rm -rf /etc
+B	DENY	nohup rm -rf /etc
+B	DENY	setsid rm -rf /etc
+B	DENY	stdbuf -oL rm -rf /etc
+B	DENY	command rm -rf /etc
+B	DENY	exec rm -rf /etc
+B	DENY	eval rm -rf /etc
+B	DENY	time rm -rf /etc
+B	DENY	sudo dd if=/dev/zero of=/dev/sda
+B	DENY	nice mkfs.ext4 /dev/sda
+B	DENY	sudo wipefs -a /dev/sda
+B	DENY	sudo -u root rm -rf /
+B	DENY	sudo -n rm -rf /etc
+B	DENY	timeout -s KILL 5 rm -rf /etc
+B	DENY	env -u PATH rm -rf /etc
+C	DENY	rm -rf /etc/*
+C	DENY	rm -rf /usr/*
+C	DENY	rm -rf /var/*
+C	DENY	rm -rf /boot/*
+C	DENY	rm -rf /bin/*
+C	DENY	rm -rf /.
+C	DENY	rm -rf /etc/..
+D	DENY	ls\nrm -rf /etc
+D	DENY	true\nmkfs.ext4 /dev/sda
+D	DENY	echo hi\rrm -rf /etc
+E	DENY	bash <(rm -rf /etc)
+E	DENY	wc -l <(rm -rf /etc)
+E	DENY	bash <<< 'rm -rf /'
+E	DENY	sh <<< "rm -rf /etc"
+E	DENY	python3 -c "import os; os.system('rm -rf /')"	scan
+E	DENY	perl -e 'system("rm -rf /etc")'	scan
+E	DENY	node -e 'require("child_process").exec("rm -rf /")'	scan
+E	DENY	echo /etc | xargs rm -rf	xargs
+E	DENY	find / -delete	find
+E	DENY	find /etc -delete	find
+E	DENY	cat /dev/zero > /dev/sda	redirect
+E	DENY	python3 -c "print('rm -rf /')"	scan
+E	DENY	find . -name x | xargs rm -rf	xargs
+SAFE	ASK	ls -la
+SAFE	ASK	rm -rf ./build
+SAFE	ASK	cat /etc/hostname
+SAFE	ASK	git status
+SAFE	ASK	rm -rf /home/user/project/node_modules
+SAFE	ASK	rm -rf /var/cache/app
+SAFE	ASK	python3 -c "print(1)"
+SAFE	ASK	find . -name '*.rs'
+SAFE	ASK	nice -n 10 cargo build
+SAFE	ASK	timeout 30 cargo test
