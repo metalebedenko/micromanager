@@ -381,7 +381,22 @@ async fn main() -> anyhow::Result<()> {
                         let ticket = ticket.ok_or_else(|| {
                             anyhow::anyhow!("укажи код-приглашение или --resume")
                         })?;
-                        micromanager::net::run_connect(&ticket, &path).await
+                        // remember-инвайт → идём через McpSession (персист A-личности + адрес B),
+                        // иначе последующий `connect --resume` невозможен. Без remember — эфемерный
+                        // debug-коннект (одноразовый, как раньше).
+                        if micromanager::net::decode_invite(&ticket)?.remember {
+                            let session = micromanager::net::McpSession::connect(&ticket).await?;
+                            let out = session
+                                .call_tool("list_dir", serde_json::json!({ "path": path }))
+                                .await?;
+                            println!(
+                                "list_dir(\"{path}\") у B (спайка запомнена — дальше `connect --resume` без кода) →\n{out}"
+                            );
+                            session.close().await;
+                            Ok(())
+                        } else {
+                            micromanager::net::run_connect(&ticket, &path).await
+                        }
                     }
                 },
                 Some(task) => {

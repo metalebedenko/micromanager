@@ -1,6 +1,6 @@
 [package]
 name = "micromanager"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 description = "Кросс-платформенные «руки для LLM» — лёгкий безопасный MCP-сервер исполнения. Тонкие руки, сменный мозг."
 license = "MIT OR Apache-2.0"
