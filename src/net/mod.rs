@@ -55,12 +55,34 @@ pub struct Invite {
     pub remember: bool,
 }
 
+/// Префикс компактного кода-приглашения. Тело — base64url(JSON) без паддинга.
+const INVITE_PREFIX: &str = "mm_";
+
+/// Кодирует инвайт в один paste-safe токен `mm_<base64url(json)>`: без кавычек,
+/// скобок и пробелов — выживает в мессенджерах и выделяется двойным кликом.
 pub fn encode_invite(inv: &Invite) -> String {
-    serde_json::to_string(inv).unwrap_or_default()
+    use base64::Engine;
+    let json = serde_json::to_string(inv).unwrap_or_default();
+    let body = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+    format!("{INVITE_PREFIX}{body}")
 }
 
+/// Декодирует инвайт. Принимает оба формата:
+/// - новый токен `mm_<base64url(json)>` — любые пробелы/переносы внутри игнорируются
+///   (устойчив к артефактам ручного копирования из терминала);
+/// - легаси сырой JSON `{...}` — обратная совместимость со старыми кодами.
 pub fn decode_invite(s: &str) -> anyhow::Result<Invite> {
-    Ok(serde_json::from_str(s.trim())?)
+    let t = s.trim();
+    if let Some(body) = t.strip_prefix(INVITE_PREFIX) {
+        use base64::Engine;
+        let body: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(body.as_bytes())
+            .map_err(|e| anyhow::anyhow!("битый код-приглашение (base64): {e}"))?;
+        Ok(serde_json::from_slice(&bytes)?)
+    } else {
+        Ok(serde_json::from_str(t)?)
+    }
 }
 
 #[cfg(test)]
@@ -117,23 +139,40 @@ mod tests {
         assert_eq!(id1, id2, "тот же ключ из файла → тот же EndpointId между рестартами");
     }
 
-    /// `Invite.remember` ходит по serde; старый код без поля → false (обратная совместимость).
+    /// Код-приглашение кодируется в paste-safe токен `mm_…`, переживает roundtrip,
+    /// терпит пробелы/переносы от ручного копирования и принимает легаси-JSON.
     #[tokio::test]
-    async fn invite_remember_serde_roundtrip_and_default() {
+    async fn invite_token_roundtrip_legacy_and_paste_safe() {
         let b = Endpoint::builder(presets::Minimal).bind().await.unwrap();
         let inv = super::Invite {
             addr: b.addr(),
             secret: "s".into(),
             remember: true,
         };
-        let enc = super::encode_invite(&inv);
-        assert!(super::decode_invite(&enc).unwrap().remember, "remember=true сохранён");
 
-        // старый код без поля remember → default false
-        let mut obj: serde_json::Value = serde_json::from_str(&enc).unwrap();
+        // новый формат — компактный токен без спецсимволов
+        let enc = super::encode_invite(&inv);
+        assert!(enc.starts_with("mm_"), "инвайт кодируется как токен mm_…, got {enc}");
+        assert!(
+            !enc.contains(['{', '}', '"', ' ', '\n']),
+            "токен paste-safe (ни скобок, ни кавычек, ни пробелов): {enc}"
+        );
+        assert!(super::decode_invite(&enc).unwrap().remember, "remember=true пережил roundtrip");
+
+        // устойчивость к пробелам/переносам, вставленным при ручном копировании из терминала
+        let mangled = format!("  {} \n {}  ", &enc[..10], &enc[10..]);
+        assert_eq!(
+            super::decode_invite(&mangled).unwrap().secret,
+            "s",
+            "пробелы/переносы внутри токена игнорируются"
+        );
+
+        // легаси: сырой JSON без поля remember → default false (обратная совместимость)
+        let raw_json = serde_json::to_string(&inv).unwrap();
+        let mut obj: serde_json::Value = serde_json::from_str(&raw_json).unwrap();
         obj.as_object_mut().unwrap().remove("remember");
         let old = serde_json::to_string(&obj).unwrap();
-        assert!(!super::decode_invite(&old).unwrap().remember, "нет поля → false");
+        assert!(!super::decode_invite(&old).unwrap().remember, "легаси JSON без remember → false");
         b.close().await;
     }
 

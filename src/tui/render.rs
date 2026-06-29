@@ -86,7 +86,7 @@ fn draw_share(frame: &mut Frame, area: Rect, app: &App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6), // шапка: код + грант + peers
+            Constraint::Length(8), // шапка: код + грант + peers + подсказка копирования
             Constraint::Min(3),    // поток действий
             Constraint::Length(3), // поле `!`-ввода
         ])
@@ -137,6 +137,14 @@ fn draw_share(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(theme::GLITCH_RED),
         )));
     }
+    lines.push(Line::from(vec![
+        Span::styled("Ctrl+Y", Style::default().fg(theme::MATRIX_GREEN)),
+        Span::styled(" — скопировать ключ в буфер для пересылки", theme::dim()),
+        match &app.share.copied {
+            Some(msg) => Span::styled(format!("   ✓ {msg}"), theme::accent()),
+            None => Span::raw(""),
+        },
+    ]));
     frame.render_widget(
         Paragraph::new(lines)
             .block(

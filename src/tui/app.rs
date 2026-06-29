@@ -124,6 +124,8 @@ pub enum Command {
     StartShare,
     /// Прекратить шеринг (закрыть эндпоинт, оборвать A).
     StopShare,
+    /// Скопировать код-приглашение в системный буфер обмена.
+    CopyInvite(String),
 }
 
 /// Display-only состояние экрана «поделиться своим ПК».
@@ -137,6 +139,8 @@ pub struct ShareView {
     pub error: Option<String>,
     /// Сводка выдаваемого гранта (для показа), берётся из настроек при старте.
     pub grant: crate::net::GrantSummary,
+    /// Транзиентный статус копирования кода в буфер («скопировано» / «буфер недоступен»).
+    pub copied: Option<String>,
 }
 
 /// Всё состояние TUI.
@@ -332,6 +336,16 @@ impl App {
     }
 
     fn on_key_share(&mut self, key: KeyEvent) -> Command {
+        // Ctrl-Y — копировать код-приглашение в буфер (обычные буквы заняты полем команд).
+        if key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return match &self.share.invite_code {
+                Some(code) => Command::CopyInvite(code.clone()),
+                None => {
+                    self.share.copied = Some("код ещё не готов".into());
+                    Command::None
+                }
+            };
+        }
         match key.code {
             KeyCode::Esc => {
                 self.focus = Focus::Chat;
@@ -868,6 +882,13 @@ impl App {
             AppEvent::ShareStopped => {
                 self.share = ShareView::default();
             }
+            AppEvent::ShareCopied(ok) => {
+                self.share.copied = Some(if ok {
+                    "ключ скопирован в буфер".into()
+                } else {
+                    "буфер недоступен".into()
+                });
+            }
         }
     }
 }
@@ -959,6 +980,22 @@ mod tests {
         assert_eq!(app.share.error.as_deref(), Some("bind failed"));
         app.on_event(AppEvent::ShareStopped);
         assert!(app.share.invite_code.is_none() && app.share.peers.is_empty());
+    }
+
+    #[test]
+    fn ctrl_y_on_share_copies_invite() {
+        use crate::tui::event::AppEvent;
+        let mut app = App::new();
+        let _ = app.on_key(key('p')); // на экран Share
+        // код ещё не готов → копировать нечего, только статус
+        assert_eq!(app.on_key(ctrl('y')), Command::None);
+        assert_eq!(app.share.copied.as_deref(), Some("код ещё не готов"));
+        // код пришёл → Ctrl+Y отдаёт CopyInvite с этим кодом
+        app.on_event(AppEvent::ShareInvite("mm_TOKEN".into()));
+        assert_eq!(app.on_key(ctrl('y')), Command::CopyInvite("mm_TOKEN".into()));
+        // подтверждение из run-loop → статус «скопировано»
+        app.on_event(AppEvent::ShareCopied(true));
+        assert_eq!(app.share.copied.as_deref(), Some("ключ скопирован в буфер"));
     }
 
     /// Мок-раннер: считает вызовы dispatch, отдаёт фиксированный ответ.

@@ -333,6 +333,13 @@ fn run_loop(
                         let _ = stop_tx.send(());
                     }
                 }
+                // Скопировать код-приглашение в системный буфер (best-effort).
+                Command::CopyInvite(code) => {
+                    let ok = arboard::Clipboard::new()
+                        .and_then(|mut cb| cb.set_text(code))
+                        .is_ok();
+                    let _ = tx.send(AppEvent::ShareCopied(ok));
+                }
             },
             AppEvent::AgentDone(ref res) => {
                 // writeback истории мозга в чат-источник ДО сброса running_chat — ТОЛЬКО для

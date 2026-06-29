@@ -58,4 +58,6 @@ pub enum AppEvent {
     ShareError(String),
     /// Шеринг остановлен (эндпоинт закрыт).
     ShareStopped,
+    /// Результат копирования кода-приглашения в буфер обмена (true — успех).
+    ShareCopied(bool),
 }

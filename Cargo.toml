@@ -1,6 +1,6 @@
 [package]
 name = "micromanager"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 description = "Кросс-платформенные «руки для LLM» — лёгкий безопасный MCP-сервер исполнения. Тонкие руки, сменный мозг."
 license = "MIT OR Apache-2.0"
@@ -28,6 +28,9 @@ directories = "6"     # платформенная папка состояния
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 base64 = "0.22"
+# системный буфер обмена — копировать код-приглашение из TUI.
+# default-features=false: нужен только текст, без тяжёлой image-data зависимости.
+arboard = { version = "3", default-features = false }
 
 [dev-dependencies]
 tempfile = "3.27.0"
