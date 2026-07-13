@@ -1,5 +1,6 @@
 //! MCP-сервер «руки» (rmcp). Регистрирует тулы и обслуживает MCP-клиента по stdio.
 
+pub mod executor;
 pub mod tools;
 
 use rmcp::{transport::stdio, ServiceExt};
