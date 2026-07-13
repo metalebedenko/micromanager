@@ -1,5 +1,6 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 pub const SESSION_SCHEMA: u32 = 1;
 
@@ -99,6 +100,12 @@ pub struct OperationRecord {
     #[serde(default)]
     pub request_key: Option<String>,
     pub command: String,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub remote_timeout_ms: u64,
+    #[serde(default)]
+    pub dispatched: bool,
     pub state: OperationState,
     pub summary: Option<String>,
     pub output: Option<String>,
@@ -127,6 +134,9 @@ impl OperationRecord {
             id: id.into(),
             request_key: None,
             command: command.into(),
+            cwd: None,
+            remote_timeout_ms: 0,
+            dispatched: false,
             state: OperationState::Queued,
             summary: None,
             output: None,

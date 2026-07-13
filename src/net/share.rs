@@ -102,7 +102,7 @@ pub struct ShareClient {
     lease_grant: LeaseGrant,
     streams: tokio::sync::Mutex<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream)>,
     _endpoint: Endpoint,
-    _connection: Connection,
+    connection: Connection,
 }
 
 struct ShareInner {
@@ -141,7 +141,7 @@ enum WireRequest {
 #[derive(Debug, Serialize, Deserialize)]
 enum WireReply {
     Hello { session_id: String },
-    Operation(OperationReply),
+    Operation(Box<OperationReply>),
     Error { message: String },
     LeaseGranted(LeaseGrant),
     SessionBusy { expires_at_unix: u64 },
@@ -296,6 +296,16 @@ impl ShareService {
         self.inner
             .drop_next_lease_reply
             .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fill_operation_queue(&self) {
+        for index in 0..crate::net::session_store::MAX_QUEUED_OPERATIONS {
+            self.inner
+                .store
+                .begin_operation(&format!("test-queued-{index}"), "queued")
+                .unwrap();
+        }
     }
 
     pub async fn shutdown(&self) -> Result<(), ShareError> {
@@ -489,7 +499,7 @@ impl ShareClient {
             lease_grant,
             streams: tokio::sync::Mutex::new((send, recv)),
             _endpoint: endpoint,
-            _connection: connection,
+            connection,
         })
     }
 
@@ -501,10 +511,14 @@ impl ShareClient {
         &self.lease_grant
     }
 
+    pub fn is_connected(&self) -> bool {
+        self.connection.close_reason().is_none()
+    }
+
     pub async fn execute(&self, request: OperationRequest) -> Result<OperationReply, ShareError> {
         let reply = self.call(WireRequest::Execute(request)).await?;
         match reply {
-            WireReply::Operation(reply) => Ok(reply),
+            WireReply::Operation(reply) => Ok(*reply),
             WireReply::Error { message } => Err(ShareError::Remote(message)),
             WireReply::SessionBusy { expires_at_unix } => Err(ShareError::Busy { expires_at_unix }),
             WireReply::OperationNotFound { operation_id } => {
@@ -674,11 +688,11 @@ async fn handle_connection(
                 message: "lease already acquired on this connection".into(),
             },
             WireRequest::Execute(request) => match inner.execute(request).await {
-                Ok(reply) => WireReply::Operation(reply),
+                Ok(reply) => WireReply::Operation(Box::new(reply)),
                 Err(error) => share_error_reply(error),
             },
             WireRequest::Status { operation_id } => match inner.store.operation(&operation_id) {
-                Ok(record) => WireReply::Operation(OperationReply { record }),
+                Ok(record) => WireReply::Operation(Box::new(OperationReply { record })),
                 Err(StoreError::OperationNotFound(_)) => {
                     WireReply::OperationNotFound { operation_id }
                 }

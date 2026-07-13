@@ -26,6 +26,7 @@ pub enum StoreError {
     Unavailable { path: PathBuf, message: String },
     AlreadyExists(PathBuf),
     Duplicate(Box<OperationRecord>),
+    IdempotencyConflict { request_key: String, operation_id: String },
     QueueFull,
     OperationNotFound(String),
     InvalidTransition(ProtocolError),
@@ -59,6 +60,10 @@ impl std::fmt::Display for StoreError {
                 )
             }
             Self::Duplicate(record) => write!(formatter, "duplicate operation {}", record.id),
+            Self::IdempotencyConflict { request_key, operation_id } => write!(
+                formatter,
+                "idempotency key {request_key} already belongs to operation {operation_id} with different input"
+            ),
             Self::QueueFull => formatter.write_str("operation queue is full"),
             Self::OperationNotFound(id) => write!(formatter, "operation {id} not found"),
             Self::InvalidTransition(error) => error.fmt(formatter),
@@ -202,6 +207,8 @@ impl SessionStore {
         &self,
         request_key: Option<&str>,
         command: &str,
+        cwd: Option<&Path>,
+        remote_timeout_ms: u64,
     ) -> Result<AllocatedOperation, StoreError> {
         let mut state = self.lock_state()?;
         ensure_writable(&state, &self.dir)?;
@@ -211,6 +218,15 @@ impl SessionStore {
                 .values()
                 .find(|record| record.request_key.as_deref() == Some(key))
         }) {
+            if existing.command != command
+                || existing.cwd.as_deref() != cwd
+                || existing.remote_timeout_ms != remote_timeout_ms
+            {
+                return Err(StoreError::IdempotencyConflict {
+                    request_key: request_key.unwrap_or_default().to_owned(),
+                    operation_id: existing.id.clone(),
+                });
+            }
             return Ok(AllocatedOperation {
                 record: existing.clone(),
                 duplicate: true,
@@ -237,6 +253,8 @@ impl SessionStore {
             })?;
         let mut record = OperationRecord::queued(format!("op-{next:020}"), command, now_unix());
         record.request_key = request_key.map(str::to_owned);
+        record.cwd = cwd.map(Path::to_path_buf);
+        record.remote_timeout_ms = remote_timeout_ms;
         self.append_or_poison(&mut state, &record)?;
         state.operations.insert(record.id.clone(), record.clone());
         Ok(AllocatedOperation {
@@ -246,6 +264,18 @@ impl SessionStore {
     }
 
     pub fn mark_running(&self, id: &str) -> Result<OperationRecord, StoreError> {
+        self.mark_running_with_dispatch(id, false)
+    }
+
+    pub fn mark_dispatched_running(&self, id: &str) -> Result<OperationRecord, StoreError> {
+        self.mark_running_with_dispatch(id, true)
+    }
+
+    fn mark_running_with_dispatch(
+        &self,
+        id: &str,
+        dispatched: bool,
+    ) -> Result<OperationRecord, StoreError> {
         let mut state = self.lock_state()?;
         ensure_writable(&state, &self.dir)?;
         self.prune_outputs(
@@ -257,6 +287,7 @@ impl SessionStore {
             .get(id)
             .cloned()
             .ok_or_else(|| StoreError::OperationNotFound(id.to_owned()))?;
+        record.dispatched |= dispatched;
         record.transition(OperationState::Running, now_unix())?;
         self.append_or_poison(&mut state, &record)?;
         state.operations.insert(id.to_owned(), record.clone());
@@ -421,6 +452,18 @@ impl SessionStore {
             .ok_or_else(|| StoreError::OperationNotFound(id.to_owned()))
     }
 
+    pub fn unfinished_operations(&self) -> Result<Vec<OperationRecord>, StoreError> {
+        let mut records: Vec<_> = self
+            .lock_state()?
+            .operations
+            .values()
+            .filter(|record| !record.state.is_terminal())
+            .cloned()
+            .collect();
+        records.sort_by_key(|record| (canonical_sequence(&record.id), record.id.clone()));
+        Ok(records)
+    }
+
     /// Terminalise operations left without a provable live process after a
     /// share-process restart. They remain in the exactly-once ledger and can
     /// never be replayed under the same operation id.
@@ -461,7 +504,14 @@ impl SessionStore {
         let last_operation = state
             .operations
             .values()
-            .max_by_key(|record| (record.updated_at_unix, record.created_at_unix))
+            .max_by_key(|record| {
+                (
+                    record.updated_at_unix,
+                    record.created_at_unix,
+                    canonical_sequence(&record.id),
+                    record.id.as_str(),
+                )
+            })
             .cloned();
         let queue_len = state
             .operations
@@ -554,6 +604,12 @@ impl SessionStore {
         }
         Ok(())
     }
+}
+
+fn canonical_sequence(id: &str) -> u64 {
+    id.strip_prefix("op-")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default()
 }
 
 fn validate_meta(meta: &SessionMeta, dir: &Path) -> Result<(), StoreError> {
@@ -853,6 +909,7 @@ fn unavailable(path: &Path, error: std::io::Error) -> StoreError {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::{Arc, Barrier};
 
     use super::{
@@ -910,7 +967,7 @@ mod tests {
         let dir = root.path().join("session-1");
         let store = SessionStore::create_engineer(&dir, engineer_meta("session-1")).unwrap();
         let allocated = store
-            .begin_allocated_operation(Some("request-a"), "echo queued")
+            .begin_allocated_operation(Some("request-a"), "echo queued", None, 1_000)
             .unwrap();
 
         let queued = store.status().unwrap();
@@ -922,6 +979,41 @@ mod tests {
         let running = store.status().unwrap();
         assert_eq!(running.queue_len, 0);
         assert_eq!(running.last_operation.unwrap().state, OperationState::Running);
+    }
+
+    #[test]
+    fn allocated_operation_persists_request_and_rejects_key_reuse_with_different_input() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("session-1");
+        let store = SessionStore::create_engineer(&dir, engineer_meta("session-1")).unwrap();
+        let cwd = PathBuf::from("/tmp/work");
+        let allocated = store
+            .begin_allocated_operation(Some("request-a"), "echo one", Some(&cwd), 5_000)
+            .unwrap();
+
+        assert_eq!(allocated.record.cwd.as_deref(), Some(cwd.as_path()));
+        assert_eq!(allocated.record.remote_timeout_ms, 5_000);
+        assert!(!allocated.record.dispatched);
+        assert!(matches!(
+            store.begin_allocated_operation(Some("request-a"), "echo two", Some(&cwd), 5_000),
+            Err(StoreError::IdempotencyConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn canonical_sequence_breaks_equal_timestamp_last_operation_ties() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("session-1");
+        let store = SessionStore::create_engineer(&dir, engineer_meta("session-1")).unwrap();
+        let first = store
+            .begin_allocated_operation(Some("a"), "first", None, 1_000)
+            .unwrap();
+        let second = store
+            .begin_allocated_operation(Some("b"), "second", None, 1_000)
+            .unwrap();
+
+        assert_eq!(first.record.created_at_unix, second.record.created_at_unix);
+        assert_eq!(store.status().unwrap().last_operation.unwrap().id, second.record.id);
     }
 
     #[test]

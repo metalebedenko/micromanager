@@ -507,7 +507,7 @@ impl HandsServer {
         let _ = self.audit.record(&AuditEntry::relay(&format!("connect:{}", status.session_id), "ok"));
         Ok(Json(SessionConnectedOutput {
             session_id: status.session_id,
-            connection: "connected".into(),
+            connection: status.connection.into(),
             lease_expires_at_unix: status.lease.expires_at_unix,
         }))
     }
@@ -520,7 +520,7 @@ impl HandsServer {
         self.relay_guard()?;
         let status = self.sessions.get(&session_id).await.map_err(controller_error)?.status().map_err(controller_error)?;
         Ok(Json(SessionStatusOutput {
-            connection: "connected".into(),
+            connection: status.connection.into(),
             queue_len: status.queue_len,
             lease: LeaseOutput {
                 controller_id: status.lease.controller_id,
@@ -624,10 +624,11 @@ impl HandsServer {
         self.relay_guard()?;
         let record = self.sessions.get(&session_id).await.map_err(controller_error)?
             .operation_status(&operation_id).await.map_err(controller_error)?;
+        let (stdout, stderr) = operation_streams(&record);
         Ok(Json(OperationOutputOutput {
             operation_id: record.id,
-            stdout: record.stdout,
-            stderr: record.stderr,
+            stdout,
+            stderr,
             truncated: record.output_truncated || record.output_pruned,
         }))
     }
@@ -664,6 +665,15 @@ fn operation_summary(record: &OperationRecord) -> OperationSummaryOutput {
         state: operation_state(record.state),
         summary: record.summary.clone(),
     }
+}
+
+fn operation_streams(record: &OperationRecord) -> (String, String) {
+    if record.stdout.is_empty() && record.stderr.is_empty() {
+        if let Some(output) = record.output.as_ref().filter(|output| !output.is_empty()) {
+            return (output.clone(), String::new());
+        }
+    }
+    (record.stdout.clone(), record.stderr.clone())
 }
 
 fn operation_state(state: OperationState) -> String {
@@ -706,6 +716,7 @@ fn controller_error(error: ControllerError) -> ErrorData {
         }
         ControllerError::UnknownInProgress { .. } => ("unknown_in_progress", true),
         ControllerError::Reconnecting => ("reconnecting", true),
+        ControllerError::IdempotencyConflict { .. } => ("idempotency_conflict", false),
         ControllerError::Remote(_) | ControllerError::Transport(_) | ControllerError::InvalidState(_) => {
             ("session_unavailable", true)
         }
@@ -714,6 +725,9 @@ fn controller_error(error: ControllerError) -> ErrorData {
     let data = Some(match &error {
         ControllerError::UnknownInProgress { operation_id } => {
             serde_json::json!({ "code": code, "operation_id": operation_id })
+        }
+        ControllerError::IdempotencyConflict { request_key, operation_id } => {
+            serde_json::json!({ "code": code, "request_key": request_key, "operation_id": operation_id })
         }
         _ => serde_json::json!({ "code": code }),
     });
@@ -808,6 +822,98 @@ mod tests {
             assert!(!names.iter().any(|name| name == legacy), "legacy {legacy} remains: {names:?}");
         }
         assert_eq!(names.len(), 13, "5 local + 8 stable session tools: {names:?}");
+    }
+
+    #[test]
+    fn legacy_combined_output_is_returned_as_best_effort_stdout() {
+        let mut record = OperationRecord::queued("legacy", "echo legacy", 1);
+        record.transition(OperationState::Running, 2).unwrap();
+        record
+            .finish(OperationState::Succeeded, "ok", "legacy output", 3)
+            .unwrap();
+
+        assert_eq!(operation_streams(&record), ("legacy output".into(), String::new()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_status_reports_transport_drop_as_reconnecting() {
+        let share_state = tempfile::tempdir().unwrap();
+        let engineer_state = tempfile::tempdir().unwrap();
+        let share = ShareService::start(share_state.path(), Arc::new(QuietObserver))
+            .await
+            .unwrap();
+        let server = HandsServer::with_sessions_dir(engineer_state.path());
+        let connected = server
+            .session_connect(Parameters(SessionConnectParams {
+                invite: share.invitation().to_owned(),
+            }))
+            .await
+            .unwrap()
+            .0;
+        share.shutdown().await.unwrap();
+
+        let status = server
+            .session_status(Parameters(SessionIdParams {
+                session_id: connected.session_id,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(status.connection, "reconnecting");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idempotency_key_input_mismatch_returns_structured_conflict() {
+        let share_state = tempfile::tempdir().unwrap();
+        let engineer_state = tempfile::tempdir().unwrap();
+        let share = ShareService::start(share_state.path(), Arc::new(QuietObserver))
+            .await
+            .unwrap();
+        let server = HandsServer::with_sessions_dir(engineer_state.path());
+        let connected = server
+            .session_connect(Parameters(SessionConnectParams {
+                invite: share.invitation().to_owned(),
+            }))
+            .await
+            .unwrap()
+            .0;
+        server
+            .remote_exec(Parameters(RemoteExecParams {
+                session_id: connected.session_id.clone(),
+                operation_id: Some("same-key".into()),
+                command: "printf one".into(),
+                cwd: None,
+                timeout_ms: Some(5_000),
+                caller_timeout_ms: None,
+            }))
+            .await
+            .unwrap();
+
+        let result = server
+            .remote_exec(Parameters(RemoteExecParams {
+                session_id: connected.session_id.clone(),
+                operation_id: Some("same-key".into()),
+                command: "printf two".into(),
+                cwd: None,
+                timeout_ms: Some(5_000),
+                caller_timeout_ms: None,
+            }))
+            .await;
+        let error = match result {
+            Ok(_) => panic!("mismatched idempotency input unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["code"].as_str()),
+            Some("idempotency_conflict")
+        );
+        server
+            .session_disconnect(Parameters(SessionIdParams {
+                session_id: connected.session_id,
+            }))
+            .await
+            .unwrap();
+        share.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
