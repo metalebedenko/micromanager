@@ -23,14 +23,12 @@ pub(crate) mod store;
 
 pub use auth::{Gatekeeper, HandshakeOutcome, PROTOCOL_VERSION};
 pub use connect::run_connect;
-pub use controller::{ControllerError, SessionController};
+pub use controller::{ControllerError, ControllerStatus, SessionController, SessionRegistry};
 pub use grant::GrantSummary;
 pub use listen::run_listen;
 pub use peers::KnownPeer;
 pub use remote::McpSession;
 pub(crate) use remote::short_id;
-#[cfg(test)]
-pub(crate) use remote::{loopback_session_with_confirmer, loopback_session_with_probe};
 pub use runner::{map_tool, McpCaller, McpHandle, McpToolRunner};
 pub use share::{run_share, OperationReply, OperationRequest, ShareClient, ShareService};
 pub use session::{Grant, ReportTo};

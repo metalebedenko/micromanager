@@ -15,7 +15,7 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "fs", "process", "signal", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rmcp = { version = "1.7.0", features = ["server", "client", "transport-io", "macros"] }
+rmcp = { version = "1.7.0", features = ["server", "client", "transport-io", "transport-child-process", "macros"] }
 schemars = "1.2.1"
 # HTTP к LLM-провайдерам. rustls вместо OpenSSL — кросс-платформа без C-зависимостей.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

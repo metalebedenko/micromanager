@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -237,6 +238,59 @@ pub struct SessionController {
     inner: Arc<ControllerInner>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ControllerStatus {
+    pub session_id: String,
+    pub queue_len: usize,
+    pub lease: LeaseMeta,
+    pub last_operation: Option<crate::net::protocol::OperationRecord>,
+}
+
+pub struct SessionRegistry {
+    sessions_dir: PathBuf,
+    sessions: tokio::sync::Mutex<HashMap<String, SessionController>>,
+}
+
+impl SessionRegistry {
+    pub fn new(sessions_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            sessions_dir: sessions_dir.into(),
+            sessions: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub async fn connect(&self, invite: &str) -> Result<SessionController, ControllerError> {
+        let controller = SessionController::connect(&self.sessions_dir, invite).await?;
+        let session_id = controller.session_id()?.to_owned();
+        self.sessions
+            .lock()
+            .await
+            .insert(session_id, controller.clone());
+        Ok(controller)
+    }
+
+    pub async fn get(&self, session_id: &str) -> Result<SessionController, ControllerError> {
+        validate_session_id(session_id)?;
+        let mut sessions = self.sessions.lock().await;
+        if let Some(controller) = sessions.get(session_id).cloned() {
+            return Ok(controller);
+        }
+        let controller = SessionController::resume(&self.sessions_dir.join(session_id)).await?;
+        sessions.insert(session_id.to_owned(), controller.clone());
+        Ok(controller)
+    }
+
+    pub async fn disconnect(&self, session_id: &str) -> Result<(), ControllerError> {
+        let active = { self.sessions.lock().await.remove(session_id) };
+        let controller = if let Some(controller) = active {
+            controller
+        } else {
+            self.get(session_id).await?
+        };
+        controller.disconnect().await
+    }
+}
+
 struct ControllerInner {
     session_dir: PathBuf,
     controller_id: String,
@@ -370,6 +424,36 @@ impl SessionController {
 
     pub fn controller_id(&self) -> &str {
         &self.inner.controller_id
+    }
+
+    pub fn session_id(&self) -> Result<&str, ControllerError> {
+        let SessionMeta::Engineer(meta) = self.inner.store.load_meta()? else {
+            return Err(ControllerError::InvalidState(
+                "share metadata replaced engineer controller metadata".into(),
+            ));
+        };
+        // The metadata is read from disk, so return the path component owned by the controller.
+        self.inner
+            .session_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| *value == meta.session_id)
+            .ok_or_else(|| ControllerError::InvalidState("session identity mismatch".into()))
+    }
+
+    pub fn status(&self) -> Result<ControllerStatus, ControllerError> {
+        let SessionMeta::Engineer(meta) = self.inner.store.load_meta()? else {
+            return Err(ControllerError::InvalidState(
+                "share metadata replaced engineer controller metadata".into(),
+            ));
+        };
+        let status = self.inner.store.status()?;
+        Ok(ControllerStatus {
+            session_id: meta.session_id,
+            queue_len: status.queue_len,
+            lease: meta.lease,
+            last_operation: status.last_operation,
+        })
     }
 
     #[cfg(test)]
@@ -555,6 +639,19 @@ impl SessionController {
         self.inner.store.save_meta(&SessionMeta::Engineer(meta))?;
         Ok(())
     }
+}
+
+fn validate_session_id(session_id: &str) -> Result<(), ControllerError> {
+    if session_id.is_empty()
+        || !session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(ControllerError::InvalidState(
+            "session_id must contain only ASCII letters, digits, '-' or '_'".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn random_id(length: usize) -> String {

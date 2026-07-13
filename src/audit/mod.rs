@@ -43,7 +43,7 @@ impl AuditEntry {
         }
     }
 
-    /// Запись релей-события A→B (`mm_connect`/`mm_remote_call`/`mm_disconnect`).
+    /// Запись события удалённой сессии A→B.
     /// У релея нет локального `Action`+`Verdict` — решение принимает владелец B.
     /// `action` — метка вида `"<host>:<tool>"`, `result` — исход (ok/ошибка).
     pub fn relay(action: &str, result: &str) -> Self {

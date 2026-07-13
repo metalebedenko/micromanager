@@ -9,10 +9,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use tokio::sync::Mutex as AsyncMutex;
-
-use crate::net::McpSession;
-
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
@@ -20,6 +16,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::audit::{self, Audit, AuditEntry, FileAudit};
+use crate::net::protocol::{OperationRecord, OperationState};
+use crate::net::{ControllerError, OperationRequest, SessionRegistry};
 use crate::safety::{
     authorize, decide, gate, Action, ActionKind, Confirmer, GateError, Policy, StdinConfirmer,
     Verdict,
@@ -57,29 +55,72 @@ pub struct SearchOutput {
     pub hits: Vec<Hit>,
 }
 
-/// Статус релей-операции (`mm_disconnect`).
 #[derive(Serialize, JsonSchema)]
-pub struct RelayStatus {
-    pub status: String,
+pub struct SessionConnectedOutput {
+    pub session_id: String,
+    pub connection: String,
+    pub lease_expires_at_unix: u64,
 }
 
-/// Результат `mm_connect`: метка хоста B + сводка выданного им гранта (информативно).
 #[derive(Serialize, JsonSchema)]
-pub struct RelayConnected {
-    pub host: String,
-    pub grant: crate::net::GrantSummary,
+pub struct SessionStatusOutput {
+    pub connection: String,
+    pub queue_len: usize,
+    pub lease: LeaseOutput,
+    pub last_operation: Option<OperationSummaryOutput>,
 }
 
-/// Список имён тулов, предоставляемых B.
 #[derive(Serialize, JsonSchema)]
-pub struct RemoteToolsOutput {
-    pub tools: Vec<String>,
+pub struct LeaseOutput {
+    pub controller_id: Option<String>,
+    pub expires_at_unix: u64,
 }
 
-/// Результат удалённого вызова тула B (человекочитаемый текст/JSON).
 #[derive(Serialize, JsonSchema)]
-pub struct RemoteCallOutput {
-    pub output: String,
+pub struct OperationSummaryOutput {
+    pub operation_id: String,
+    pub state: String,
+    pub summary: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct JournalOutput {
+    pub session_id: String,
+    pub markdown: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct NoteAppendedOutput {
+    pub session_id: String,
+    pub appended: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct RemoteExecOutput {
+    pub operation_id: String,
+    pub state: OperationState,
+    pub summary: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct OperationStatusOutput {
+    pub operation_id: String,
+    pub state: OperationState,
+    pub summary: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct OperationOutputOutput {
+    pub operation_id: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub truncated: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct SessionDisconnectedOutput {
+    pub session_id: String,
+    pub connection: String,
 }
 
 // ─── Чистая логика (тестируемая без MCP) ────────────────────────────────────
@@ -275,16 +316,30 @@ pub struct RunShellParams {
     pub command: String,
 }
 #[derive(Deserialize, JsonSchema)]
-pub struct MmConnectParams {
-    /// Код-приглашение (ticket) от компьютера B.
-    pub ticket: String,
+pub struct SessionConnectParams {
+    pub invite: String,
 }
 #[derive(Deserialize, JsonSchema)]
-pub struct MmRemoteCallParams {
-    /// Имя тула B (например list_dir, read_file, run_shell).
-    pub tool: String,
-    /// Аргументы тула — JSON-объект.
-    pub args: serde_json::Value,
+pub struct SessionIdParams {
+    pub session_id: String,
+}
+#[derive(Deserialize, JsonSchema)]
+pub struct SessionNoteAppendParams {
+    pub session_id: String,
+    pub note: String,
+}
+#[derive(Deserialize, JsonSchema)]
+pub struct RemoteExecParams {
+    pub session_id: String,
+    pub operation_id: Option<String>,
+    pub command: String,
+    pub cwd: Option<PathBuf>,
+    pub timeout_ms: Option<u64>,
+}
+#[derive(Deserialize, JsonSchema)]
+pub struct OperationParams {
+    pub session_id: String,
+    pub operation_id: String,
 }
 
 // ─── MCP-сервер ─────────────────────────────────────────────────────────────
@@ -301,8 +356,7 @@ pub struct HandsServer {
     /// Релей A→B включён только на локальном `serve` (внешний мозг оркеструет B).
     /// На сетевом узле-B (`with`) выключен: B не должен звонить наружу (B→C-цепочки).
     relay_enabled: bool,
-    /// Единственный слот удалённой B-сессии (одно подключение за раз).
-    relay_session: Arc<AsyncMutex<Option<McpSession>>>,
+    sessions: Arc<SessionRegistry>,
 }
 
 #[tool_router]
@@ -314,7 +368,7 @@ impl HandsServer {
             confirmer: Arc::new(StdinConfirmer::default()),
             audit: Arc::new(FileAudit::new(audit::default_path())),
             relay_enabled: true,
-            relay_session: Arc::new(AsyncMutex::new(None)),
+            sessions: Arc::new(SessionRegistry::new(crate::paths::state_path("sessions"))),
         }
     }
 
@@ -327,8 +381,15 @@ impl HandsServer {
             confirmer,
             audit,
             relay_enabled: false,
-            relay_session: Arc::new(AsyncMutex::new(None)),
+            sessions: Arc::new(SessionRegistry::new(crate::paths::state_path("sessions"))),
         }
+    }
+
+    #[cfg(test)]
+    fn with_sessions_dir(sessions_dir: &Path) -> Self {
+        let mut server = Self::new();
+        server.sessions = Arc::new(SessionRegistry::new(sessions_dir));
+        server
     }
 
     #[tool(
@@ -434,137 +495,136 @@ impl HandsServer {
             .map_err(gate_err)
     }
 
-    // ─── Релей A→B (только на локальном `serve`; инертен на узле-B) ──────────
-
-    #[tool(
-        name = "mm_connect",
-        description = "Подключиться к компьютеру B по коду-приглашению (ticket). Возвращает метку хоста и сводку гранта B. Одно подключение за раз — перед новым вызвать mm_disconnect."
-    )]
-    async fn mm_connect(
+    #[tool(name = "session_connect", description = "Connect to a shared remote session by invitation.")]
+    async fn session_connect(
         &self,
-        Parameters(MmConnectParams { ticket }): Parameters<MmConnectParams>,
-    ) -> Result<Json<RelayConnected>, ErrorData> {
+        Parameters(SessionConnectParams { invite }): Parameters<SessionConnectParams>,
+    ) -> Result<Json<SessionConnectedOutput>, ErrorData> {
         self.relay_guard()?;
-        let mut slot = self.relay_session.lock().await;
-        if let Some(existing) = slot.as_ref() {
-            // Guard ДО сети: занятый слот не трогаем, существующую сессию не подменяем.
-            return Err(ErrorData::invalid_request(
-                format!(
-                    "уже подключено к {}, сначала mm_disconnect",
-                    existing.host_label()
-                ),
-                None,
-            ));
-        }
-        match McpSession::connect(&ticket).await {
-            Ok(session) => {
-                let host = session.host_label().to_string();
-                let grant = session.grant().clone();
-                let _ = self
-                    .audit
-                    .record(&AuditEntry::relay(&format!("connect:{host}"), "ok"));
-                *slot = Some(session);
-                Ok(Json(RelayConnected { host, grant }))
-            }
-            Err(e) => {
-                let _ = self
-                    .audit
-                    .record(&AuditEntry::relay("connect", &format!("error: {e}")));
-                Err(ErrorData::internal_error(
-                    format!("подключение к B не удалось: {e}"),
-                    None,
-                ))
-            }
-        }
+        let controller = self.sessions.connect(&invite).await.map_err(controller_error)?;
+        let status = controller.status().map_err(controller_error)?;
+        let _ = self.audit.record(&AuditEntry::relay(&format!("connect:{}", status.session_id), "ok"));
+        Ok(Json(SessionConnectedOutput {
+            session_id: status.session_id,
+            connection: "connected".into(),
+            lease_expires_at_unix: status.lease.expires_at_unix,
+        }))
     }
 
-    #[tool(
-        name = "mm_remote_tools",
-        description = "Список имён тулов, которые предоставляет подключённый компьютер B."
-    )]
-    async fn mm_remote_tools(&self) -> Result<Json<RemoteToolsOutput>, ErrorData> {
-        self.relay_guard()?;
-        let slot = self.relay_session.lock().await;
-        let session = slot.as_ref().ok_or_else(|| {
-            ErrorData::invalid_request("не подключено — сначала mm_connect".to_string(), None)
-        })?;
-        let host = session.host_label().to_string();
-        match session.list_tool_names().await {
-            Ok(tools) => {
-                let _ = self.audit.record(&AuditEntry::relay(
-                    &format!("{host}:list_tools"),
-                    &format!("ok: {} tools", tools.len()),
-                ));
-                Ok(Json(RemoteToolsOutput { tools }))
-            }
-            Err(e) => {
-                let _ = self
-                    .audit
-                    .record(&AuditEntry::relay(&format!("{host}:list_tools"), &format!("error: {e}")));
-                Err(ErrorData::internal_error(
-                    format!("не удалось получить тулы B: {e}"),
-                    None,
-                ))
-            }
-        }
-    }
-
-    #[tool(
-        name = "mm_remote_call",
-        description = "Выполнить тул компьютера B по имени с JSON-аргументами (объект). Действие проходит вето владельца B; результат возвращается как текст."
-    )]
-    async fn mm_remote_call(
+    #[tool(name = "session_status", description = "Return connection, queue, lease, and latest operation state.")]
+    async fn session_status(
         &self,
-        Parameters(MmRemoteCallParams { tool, args }): Parameters<MmRemoteCallParams>,
-    ) -> Result<Json<RemoteCallOutput>, ErrorData> {
+        Parameters(SessionIdParams { session_id }): Parameters<SessionIdParams>,
+    ) -> Result<Json<SessionStatusOutput>, ErrorData> {
         self.relay_guard()?;
-        // Валидация ДО сети: McpSession::call_tool молча роняет не-объект в None.
-        if !args.is_object() {
-            return Err(ErrorData::invalid_request(
-                "args должен быть JSON-объектом".to_string(),
-                None,
-            ));
-        }
-        let slot = self.relay_session.lock().await;
-        let session = slot.as_ref().ok_or_else(|| {
-            ErrorData::invalid_request("не подключено — сначала mm_connect".to_string(), None)
-        })?;
-        let host = session.host_label().to_string();
-        match session.call_tool(&tool, args).await {
-            Ok(output) => {
-                let _ = self
-                    .audit
-                    .record(&AuditEntry::relay(&format!("{host}:{tool}"), "ok"));
-                Ok(Json(RemoteCallOutput { output }))
-            }
-            Err(e) => {
-                // Ошибка вызова / обрыв / отказ вето B → текст мозгу, не паника.
-                let _ = self
-                    .audit
-                    .record(&AuditEntry::relay(&format!("{host}:{tool}"), &format!("error: {e}")));
-                Err(ErrorData::internal_error(
-                    format!("вызов тула B '{tool}' не удался: {e}"),
-                    None,
-                ))
-            }
-        }
+        let status = self.sessions.get(&session_id).await.map_err(controller_error)?.status().map_err(controller_error)?;
+        Ok(Json(SessionStatusOutput {
+            connection: "connected".into(),
+            queue_len: status.queue_len,
+            lease: LeaseOutput {
+                controller_id: status.lease.controller_id,
+                expires_at_unix: status.lease.expires_at_unix,
+            },
+            last_operation: status.last_operation.as_ref().map(operation_summary),
+        }))
     }
 
-    #[tool(
-        name = "mm_disconnect",
-        description = "Закрыть активную удалённую сессию с компьютером B (идемпотентно)."
-    )]
-    async fn mm_disconnect(&self) -> Result<Json<RelayStatus>, ErrorData> {
+    #[tool(name = "session_journal", description = "Read the durable Markdown journal for a remote session.")]
+    async fn session_journal(
+        &self,
+        Parameters(SessionIdParams { session_id }): Parameters<SessionIdParams>,
+    ) -> Result<Json<JournalOutput>, ErrorData> {
         self.relay_guard()?;
-        let taken = self.relay_session.lock().await.take();
-        let status = if let Some(session) = taken {
-            session.close().await;
-            "сессия закрыта".to_string()
-        } else {
-            "нет активной сессии".to_string()
+        let controller = self.sessions.get(&session_id).await.map_err(controller_error)?;
+        let path = controller.session_dir().join("journal.md");
+        let markdown = match tokio::fs::read_to_string(&path).await {
+            Ok(markdown) => markdown,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(storage_error(error.to_string())),
         };
-        let _ = self.audit.record(&AuditEntry::relay("disconnect", &status));
-        Ok(Json(RelayStatus { status }))
+        Ok(Json(JournalOutput { session_id, markdown }))
+    }
+
+    #[tool(name = "session_note_append", description = "Append a redacted timestamped note to the durable session journal.")]
+    async fn session_note_append(
+        &self,
+        Parameters(SessionNoteAppendParams { session_id, note }): Parameters<SessionNoteAppendParams>,
+    ) -> Result<Json<NoteAppendedOutput>, ErrorData> {
+        self.relay_guard()?;
+        let controller = self.sessions.get(&session_id).await.map_err(controller_error)?;
+        let redacted = crate::tg::redact(&note);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        let entry = format!("## {timestamp}\n\n{redacted}\n\n");
+        append_private(&controller.session_dir().join("journal.md"), entry.as_bytes()).await?;
+        Ok(Json(NoteAppendedOutput { session_id, appended: true }))
+    }
+
+    #[tool(name = "remote_exec", description = "Execute an unrestricted command in an addressed remote session.")]
+    async fn remote_exec(
+        &self,
+        Parameters(params): Parameters<RemoteExecParams>,
+    ) -> Result<Json<RemoteExecOutput>, ErrorData> {
+        self.relay_guard()?;
+        let controller = self.sessions.get(&params.session_id).await.map_err(controller_error)?;
+        let operation_id = params.operation_id.unwrap_or_else(random_operation_id);
+        let reply = controller.execute(OperationRequest {
+            session_id: params.session_id,
+            operation_id: operation_id.clone(),
+            command: params.command,
+            cwd: params.cwd,
+            timeout: std::time::Duration::from_millis(params.timeout_ms.unwrap_or(30_000)),
+        }).await.map_err(controller_error)?;
+        Ok(Json(RemoteExecOutput {
+            operation_id,
+            state: reply.record.state,
+            summary: reply.record.summary.unwrap_or_default(),
+        }))
+    }
+
+    #[tool(name = "operation_status", description = "Return durable state for a remote operation.")]
+    async fn operation_status(
+        &self,
+        Parameters(OperationParams { session_id, operation_id }): Parameters<OperationParams>,
+    ) -> Result<Json<OperationStatusOutput>, ErrorData> {
+        self.relay_guard()?;
+        let record = self.sessions.get(&session_id).await.map_err(controller_error)?
+            .operation_status(&operation_id).await.map_err(controller_error)?;
+        Ok(Json(OperationStatusOutput {
+            operation_id: record.id,
+            state: record.state,
+            summary: record.summary,
+        }))
+    }
+
+    #[tool(name = "operation_output", description = "Return stdout and stderr captured for a remote operation.")]
+    async fn operation_output(
+        &self,
+        Parameters(OperationParams { session_id, operation_id }): Parameters<OperationParams>,
+    ) -> Result<Json<OperationOutputOutput>, ErrorData> {
+        self.relay_guard()?;
+        let record = self.sessions.get(&session_id).await.map_err(controller_error)?
+            .operation_status(&operation_id).await.map_err(controller_error)?;
+        let (stdout, stderr) = split_output(record.output.as_deref().unwrap_or_default());
+        Ok(Json(OperationOutputOutput {
+            operation_id: record.id,
+            stdout,
+            stderr,
+            truncated: record.output_truncated || record.output_pruned,
+        }))
+    }
+
+    #[tool(name = "session_disconnect", description = "Release and remove an addressed remote session connection.")]
+    async fn session_disconnect(
+        &self,
+        Parameters(SessionIdParams { session_id }): Parameters<SessionIdParams>,
+    ) -> Result<Json<SessionDisconnectedOutput>, ErrorData> {
+        self.relay_guard()?;
+        self.sessions.disconnect(&session_id).await.map_err(controller_error)?;
+        let _ = self.audit.record(&AuditEntry::relay(&format!("disconnect:{session_id}"), "ok"));
+        Ok(Json(SessionDisconnectedOutput { session_id, connection: "disconnected".into() }))
     }
 }
 
@@ -580,6 +640,91 @@ impl HandsServer {
         }
         Ok(())
     }
+}
+
+fn operation_summary(record: &OperationRecord) -> OperationSummaryOutput {
+    OperationSummaryOutput {
+        operation_id: record.id.clone(),
+        state: operation_state(record.state),
+        summary: record.summary.clone(),
+    }
+}
+
+fn operation_state(state: OperationState) -> String {
+    serde_json::to_value(state)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn random_operation_id() -> String {
+    use rand::Rng;
+    let suffix: String = rand::rng()
+        .sample_iter(rand::distr::Alphanumeric)
+        .take(20)
+        .map(char::from)
+        .collect();
+    format!("op-{suffix}")
+}
+
+fn split_output(output: &str) -> (String, String) {
+    match output.split_once("\n[stderr]\n") {
+        Some((stdout, stderr)) => (stdout.to_owned(), stderr.to_owned()),
+        None => (output.to_owned(), String::new()),
+    }
+}
+
+async fn append_private(path: &Path, bytes: &[u8]) -> Result<(), ErrorData> {
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+        .map_err(|error| storage_error(error.to_string()))?;
+    file.write_all(bytes)
+        .await
+        .map_err(|error| storage_error(error.to_string()))?;
+    file.sync_all()
+        .await
+        .map_err(|error| storage_error(error.to_string()))?;
+    #[cfg(unix)]
+    tokio::fs::set_permissions(path, {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::Permissions::from_mode(0o600)
+    })
+    .await
+    .map_err(|error| storage_error(error.to_string()))?;
+    Ok(())
+}
+
+fn controller_error(error: ControllerError) -> ErrorData {
+    let (code, internal) = match &error {
+        ControllerError::Busy { .. } => ("session_busy", false),
+        ControllerError::QueueFull => ("queue_full", false),
+        ControllerError::Storage(_) | ControllerError::RemoteStorage(_) => {
+            ("storage_unavailable", true)
+        }
+        ControllerError::UnknownInProgress { .. } => ("unknown_in_progress", true),
+        ControllerError::Reconnecting => ("reconnecting", true),
+        ControllerError::Remote(_) | ControllerError::Transport(_) | ControllerError::InvalidState(_) => {
+            ("session_unavailable", true)
+        }
+    };
+    let message = format!("{code}: {error}");
+    let data = Some(serde_json::json!({ "code": code }));
+    if internal {
+        ErrorData::internal_error(message, data)
+    } else {
+        ErrorData::invalid_request(message, data)
+    }
+}
+
+fn storage_error(message: String) -> ErrorData {
+    ErrorData::internal_error(
+        format!("storage_unavailable: {message}"),
+        Some(serde_json::json!({ "code": "storage_unavailable" })),
+    )
 }
 
 fn gate_err(e: GateError) -> ErrorData {
@@ -599,248 +744,109 @@ impl Default for HandsServer {
 impl ServerHandler for HandsServer {}
 
 #[cfg(test)]
-mod relay_tests {
+mod tests {
     use super::*;
-    use crate::audit::{AuditEntry, NullAudit};
-    use std::sync::Mutex as StdMutex;
+    use crate::net::protocol::OperationState;
+    use crate::net::{ControllerError, ShareService};
+    use crate::server::executor::{ExecResult, TerminalObserver};
 
-    /// Журнал, фиксирующий записи в память — для проверки релей-аудита.
-    #[derive(Default)]
-    struct RecordingAudit(StdMutex<Vec<AuditEntry>>);
-    impl Audit for RecordingAudit {
-        fn record(&self, entry: &AuditEntry) -> std::io::Result<()> {
-            self.0.lock().unwrap().push(entry.clone());
-            Ok(())
-        }
-    }
-    impl RecordingAudit {
-        fn entries(&self) -> Vec<AuditEntry> {
-            self.0.lock().unwrap().clone()
-        }
+    struct QuietObserver;
+    impl TerminalObserver for QuietObserver {
+        fn started(&self, _: &str) {}
+        fn finished(&self, _: &ExecResult) {}
+        fn failed(&self, _: &str, _: &str) {}
     }
 
-    /// Локальный `serve` (new) включает релей; сетевой `listen` (with) — нет.
-    /// Релей-тулы инертны на узле-B, чтобы B не звонил наружу (B→C-цепочки).
     #[test]
-    fn relay_enabled_for_serve_disabled_for_listen() {
-        let serve = HandsServer::new();
-        assert!(serve.relay_enabled, "serve (new) должен включать релей");
-
-        let listen = HandsServer::with(
-            Policy::default(),
-            Arc::new(StdinConfirmer::default()),
-            Arc::new(NullAudit),
-        );
-        assert!(!listen.relay_enabled, "listen (with) должен выключать релей");
+    fn serve_lists_stable_session_tools() {
+        let router = HandsServer::tool_router();
+        let names: Vec<String> = router.list_all().iter().map(|tool| tool.name.to_string()).collect();
+        for name in [
+            "list_dir", "read_file", "search", "write_file", "run_shell",
+            "session_connect", "session_status", "session_journal", "session_note_append",
+            "remote_exec", "operation_status", "operation_output", "session_disconnect",
+        ] {
+            assert!(names.iter().any(|candidate| candidate == name), "missing {name}: {names:?}");
+        }
+        for legacy in ["mm_connect", "mm_remote_tools", "mm_remote_call", "mm_disconnect"] {
+            assert!(!names.iter().any(|name| name == legacy), "legacy {legacy} remains: {names:?}");
+        }
+        assert_eq!(names.len(), 13, "5 local + 8 stable session tools: {names:?}");
     }
 
-    /// Без активной сессии `mm_disconnect` — идемпотентный успех (не ошибка), слот пуст.
-    #[tokio::test]
-    async fn mm_disconnect_idempotent_without_session() {
-        let mut server = HandsServer::new();
-        let rec = Arc::new(RecordingAudit::default());
-        server.audit = rec.clone();
-
-        let out = server.mm_disconnect().await.expect("disconnect без сессии — успех");
-        assert!(out.0.status.contains("нет активной"), "статус: {}", out.0.status);
-        assert!(server.relay_session.lock().await.is_none());
-        assert!(
-            rec.entries().iter().any(|e| e.kind == "relay"),
-            "релей-аудит записан"
-        );
-    }
-
-    /// С активной сессией `mm_disconnect` закрывает её и очищает слот.
     #[tokio::test(flavor = "multi_thread")]
-    async fn mm_disconnect_closes_active_session() {
-        let (session, b_task, _dir) = crate::net::loopback_session_with_probe().await;
-        let server = HandsServer::new();
-        *server.relay_session.lock().await = Some(session);
+    async fn remote_exec_returns_operation_id_and_summary() {
+        let share_state = tempfile::tempdir().unwrap();
+        let engineer_state = tempfile::tempdir().unwrap();
+        let share = ShareService::start(share_state.path(), Arc::new(QuietObserver)).await.unwrap();
+        let server = HandsServer::with_sessions_dir(engineer_state.path());
+        let connected = server.session_connect(Parameters(SessionConnectParams {
+            invite: share.invitation().to_owned(),
+        })).await.unwrap();
 
-        let out = server.mm_disconnect().await.expect("disconnect закрывает сессию");
-        assert!(out.0.status.contains("закрыт"), "статус: {}", out.0.status);
-        assert!(
-            server.relay_session.lock().await.is_none(),
-            "слот очищен после disconnect"
-        );
-        b_task.abort();
-    }
+        let output = server.remote_exec(Parameters(RemoteExecParams {
+            session_id: connected.0.session_id.clone(),
+            operation_id: Some("tool-op-1".into()),
+            command: "printf 'hello'".into(),
+            cwd: None,
+            timeout_ms: Some(5_000),
+        })).await.unwrap();
 
-    /// На узле-B релей-тул `mm_connect` инертен: отказ (без сети).
-    #[tokio::test]
-    async fn mm_connect_refused_on_b_node() {
-        let listen = HandsServer::with(
-            Policy::default(),
-            Arc::new(StdinConfirmer::default()),
-            Arc::new(NullAudit),
-        );
-        let res = listen
-            .mm_connect(Parameters(MmConnectParams {
-                ticket: "anything".into(),
-            }))
-            .await;
-        assert!(res.is_err(), "на узле-B mm_connect отключён");
-        assert!(format!("{:?}", res.err().unwrap()).contains("отключ"));
-    }
-
-    /// При уже активной сессии `mm_connect` отказывает (без попытки сети — guard до connect),
-    /// существующая сессия не тронута.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn mm_connect_refuses_when_already_connected() {
-        let (session, b_task, _dir) = crate::net::loopback_session_with_probe().await;
-        let server = HandsServer::new();
-        *server.relay_session.lock().await = Some(session);
-
-        let res = server
-            .mm_connect(Parameters(MmConnectParams {
-                ticket: "ignored-ticket".into(),
-            }))
-            .await;
-        assert!(res.is_err(), "повторный connect при активной сессии — ошибка");
-        assert!(
-            format!("{:?}", res.err().unwrap()).contains("уже подключено"),
-            "ошибка должна предлагать mm_disconnect"
-        );
-        // существующая сессия не подменена
-        assert!(server.relay_session.lock().await.is_some());
-
-        let s = server.relay_session.lock().await.take().unwrap();
-        s.close().await;
-        b_task.abort();
-    }
-
-    /// Loopback: с активной сессией `mm_remote_tools` непуст (есть list_dir),
-    /// `mm_remote_call("list_dir", {path})` возвращает листинг B (probe.txt).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn mm_remote_tools_and_call_loopback() {
-        let (session, b_task, dir) = crate::net::loopback_session_with_probe().await;
-        let server = HandsServer::new();
-        *server.relay_session.lock().await = Some(session);
-
-        let tools = server.mm_remote_tools().await.expect("список тулов B");
-        assert!(
-            tools.0.tools.iter().any(|t| t == "list_dir"),
-            "тулы B: {:?}",
-            tools.0.tools
-        );
-
-        let out = server
-            .mm_remote_call(Parameters(MmRemoteCallParams {
-                tool: "list_dir".into(),
-                args: serde_json::json!({ "path": dir.path().to_string_lossy() }),
+        assert_eq!(output.0.operation_id, "tool-op-1");
+        assert_eq!(output.0.state, OperationState::Succeeded);
+        assert!(output.0.summary.contains("stdout=5B"), "{}", output.0.summary);
+        let captured = server
+            .operation_output(Parameters(OperationParams {
+                session_id: connected.0.session_id.clone(),
+                operation_id: "tool-op-1".into(),
             }))
             .await
-            .expect("remote_call list_dir");
-        assert!(out.0.output.contains("probe.txt"), "вывод B: {}", out.0.output);
-
-        let s = server.relay_session.lock().await.take().unwrap();
-        s.close().await;
-        b_task.abort();
+            .unwrap();
+        assert_eq!(captured.0.stdout, "hello");
+        assert!(captured.0.stderr.is_empty());
+        assert!(!captured.0.truncated);
+        server.session_disconnect(Parameters(SessionIdParams {
+            session_id: connected.0.session_id,
+        })).await.unwrap();
+        share.shutdown().await.unwrap();
     }
 
-    /// Success criterion #5: мутация на B через `mm_remote_call` под вето владельца B
-    /// (No-confirmer) → ошибка мозгу как ErrorData, файл НЕ создан, транспорт A цел.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn mm_remote_call_relays_b_owner_veto_as_error() {
-        use crate::safety::{Action, Confirmer};
-        struct No;
-        impl Confirmer for No {
-            fn confirm(&self, _: &Action) -> bool {
-                false
-            }
-        }
-
-        let (session, b_task, dir) =
-            crate::net::loopback_session_with_confirmer(Arc::new(No)).await;
-        let server = HandsServer::new();
-        *server.relay_session.lock().await = Some(session);
-
-        let target = dir.path().join("vetoed.txt");
-        let res = server
-            .mm_remote_call(Parameters(MmRemoteCallParams {
-                tool: "write_file".into(),
-                args: serde_json::json!({
-                    "path": target.to_string_lossy(),
-                    "content": "x"
-                }),
-            }))
-            .await;
-        assert!(res.is_err(), "вето владельца B → ошибка мозгу, не успех");
-        assert!(!target.exists(), "вето владельца B: файл не создан на B");
-
-        // транспорт A цел: следующий вызов всё ещё работает
-        let still = server.mm_remote_tools().await;
-        assert!(still.is_ok(), "сессия жива после отказа B");
-
-        let s = server.relay_session.lock().await.take().unwrap();
-        s.close().await;
-        b_task.abort();
-    }
-
-    /// Без активной сессии оба тула отдают понятную ошибку «не подключено».
-    #[tokio::test]
-    async fn mm_remote_without_session_errors() {
-        let server = HandsServer::new();
-        assert!(server.mm_remote_tools().await.is_err());
-        let res = server
-            .mm_remote_call(Parameters(MmRemoteCallParams {
-                tool: "list_dir".into(),
-                args: serde_json::json!({ "path": "." }),
-            }))
-            .await;
-        assert!(format!("{:?}", res.err().unwrap()).contains("не подключено"));
-    }
-
-    /// Не-объектный `args` отвергается ДО сети (McpSession иначе молча уронит его в None).
-    #[tokio::test]
-    async fn mm_remote_call_rejects_non_object_args() {
-        let server = HandsServer::new();
-        let res = server
-            .mm_remote_call(Parameters(MmRemoteCallParams {
-                tool: "list_dir".into(),
-                args: serde_json::json!("строка-а-не-объект"),
-            }))
-            .await;
-        assert!(res.is_err(), "не-объектный args → ошибка");
-        assert!(format!("{:?}", res.err().unwrap()).contains("объект"));
-    }
-
-    /// Приёмка: `serve` регистрирует ровно 9 тулов — 5 локальных + 4 релейных.
-    /// Тулы существуют и на узле-B (тот же тип), но там инертны (см. *_refused_on_b_node).
     #[test]
-    fn serve_exposes_nine_tools_including_relay() {
-        let router = HandsServer::tool_router();
-        let names: Vec<String> = router.list_all().iter().map(|t| t.name.to_string()).collect();
-        for n in [
-            "list_dir",
-            "read_file",
-            "search",
-            "write_file",
-            "run_shell",
-            "mm_connect",
-            "mm_remote_tools",
-            "mm_remote_call",
-            "mm_disconnect",
+    fn busy_and_queue_full_are_structured_errors() {
+        for (error, stable_code) in [
+            (ControllerError::Busy { expires_at_unix: 42 }, "session_busy"),
+            (ControllerError::QueueFull, "queue_full"),
         ] {
-            assert!(names.iter().any(|x| x == n), "нет тула {n} в {names:?}");
+            let mapped = controller_error(error);
+            assert_eq!(mapped.data.as_ref().and_then(|value| value.get("code")).and_then(|value| value.as_str()), Some(stable_code));
+            assert!(mapped.message.contains(stable_code));
         }
-        assert_eq!(names.len(), 9, "ровно 9 тулов в serve: {names:?}");
     }
 
-    /// На узле-B (`with`, relay_enabled=false) релей-тул инертен: отказ.
-    #[tokio::test]
-    async fn mm_disconnect_refused_on_b_node() {
-        let listen = HandsServer::with(
-            Policy::default(),
-            Arc::new(StdinConfirmer::default()),
-            Arc::new(NullAudit),
-        );
-        let res = listen.mm_disconnect().await;
-        assert!(res.is_err(), "на узле-B релей отключён");
-        let err = res.err().unwrap();
-        assert!(
-            format!("{err:?}").contains("отключ"),
-            "ошибка должна говорить, что релей отключён: {err:?}"
-        );
+    #[tokio::test(flavor = "multi_thread")]
+    async fn note_append_survives_controller_restart_redacted() {
+        let share_state = tempfile::tempdir().unwrap();
+        let engineer_state = tempfile::tempdir().unwrap();
+        let share = ShareService::start(share_state.path(), Arc::new(QuietObserver)).await.unwrap();
+        let server = HandsServer::with_sessions_dir(engineer_state.path());
+        let connected = server.session_connect(Parameters(SessionConnectParams {
+            invite: share.invitation().to_owned(),
+        })).await.unwrap().0;
+        server.session_note_append(Parameters(SessionNoteAppendParams {
+            session_id: connected.session_id.clone(),
+            note: "TOKEN=super-secret-value".into(),
+        })).await.unwrap();
+        drop(server);
+
+        let restarted = HandsServer::with_sessions_dir(engineer_state.path());
+        let journal = restarted.session_journal(Parameters(SessionIdParams {
+            session_id: connected.session_id.clone(),
+        })).await.unwrap();
+        assert!(journal.0.markdown.contains("TOKEN=***"), "{}", journal.0.markdown);
+        assert!(!journal.0.markdown.contains("super-secret-value"));
+        restarted.session_disconnect(Parameters(SessionIdParams {
+            session_id: connected.session_id,
+        })).await.unwrap();
+        share.shutdown().await.unwrap();
     }
 }

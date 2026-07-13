@@ -90,6 +90,12 @@ pub struct SessionStore {
     state: Mutex<StoreState>,
 }
 
+#[derive(Debug, Clone)]
+pub struct StoreStatus {
+    pub queue_len: usize,
+    pub last_operation: Option<OperationRecord>,
+}
+
 impl SessionStore {
     pub fn create_engineer(dir: &Path, meta: EngineerSessionMeta) -> Result<Self, StoreError> {
         Self::create_with_meta(dir, SessionMeta::Engineer(meta))
@@ -302,6 +308,24 @@ impl SessionStore {
         self.lock_state()
             .map(|state| state.output_bytes)
             .unwrap_or_default()
+    }
+
+    pub fn status(&self) -> Result<StoreStatus, StoreError> {
+        let state = self.lock_state()?;
+        let last_operation = state
+            .operations
+            .values()
+            .max_by_key(|record| (record.updated_at_unix, record.created_at_unix))
+            .cloned();
+        let queue_len = state
+            .operations
+            .values()
+            .filter(|record| record.state == OperationState::Queued)
+            .count();
+        Ok(StoreStatus {
+            queue_len,
+            last_operation,
+        })
     }
 
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, StoreState>, StoreError> {

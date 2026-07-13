@@ -4,6 +4,9 @@ use std::time::Duration;
 use micromanager::net::protocol::OperationState;
 use micromanager::net::{OperationRequest, SessionController, ShareService};
 use micromanager::server::executor::{ExecResult, TerminalObserver};
+use rmcp::model::CallToolRequestParams;
+use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+use rmcp::ServiceExt;
 
 struct QuietObserver;
 
@@ -103,6 +106,87 @@ mod core_remote_assist {
             assert_eq!(std::fs::read_to_string(output).unwrap(), "once\n");
             resumed.disconnect().await.unwrap();
             service.shutdown().await.unwrap();
+        }
+    }
+
+    pub mod mcp {
+        use super::*;
+
+        async fn call(
+            client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+            tool: &str,
+            arguments: serde_json::Value,
+        ) -> serde_json::Value {
+            let mut params = CallToolRequestParams::new(tool.to_owned());
+            params.arguments = arguments.as_object().cloned();
+            client
+                .peer()
+                .call_tool(params)
+                .await
+                .unwrap()
+                .structured_content
+                .expect("stable tools return object structured content")
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn stable_session_tools_work_through_real_stdio_mcp() {
+            let share_state = tempfile::tempdir().unwrap();
+            let engineer_state = tempfile::tempdir().unwrap();
+            let share = ShareService::start(share_state.path(), Arc::new(QuietObserver))
+                .await
+                .unwrap();
+            let transport = TokioChildProcess::new(
+                tokio::process::Command::new(env!("CARGO_BIN_EXE_micromanager")).configure(|cmd| {
+                    cmd.arg("serve").env("MM_STATE_DIR", engineer_state.path());
+                }),
+            )
+            .unwrap();
+            let client = ().serve(transport).await.unwrap();
+
+            let tools = client.list_all_tools().await.unwrap();
+            for name in [
+                "session_connect",
+                "session_status",
+                "session_journal",
+                "session_note_append",
+                "remote_exec",
+                "operation_status",
+                "operation_output",
+                "session_disconnect",
+            ] {
+                let tool = tools.iter().find(|tool| tool.name == name).unwrap();
+                assert_eq!(tool.input_schema.get("type").and_then(|value| value.as_str()), Some("object"));
+                assert_eq!(tool.output_schema.as_ref().and_then(|schema| schema.get("type")).and_then(|value| value.as_str()), Some("object"));
+            }
+
+            let connected = call(&client, "session_connect", serde_json::json!({
+                "invite": share.invitation(),
+            })).await;
+            let session_id = connected["session_id"].as_str().unwrap().to_owned();
+            assert_eq!(connected["connection"], "connected");
+
+            let executed = call(&client, "remote_exec", serde_json::json!({
+                "session_id": session_id,
+                "operation_id": "stdio-op-1",
+                "command": "printf 'stdio-ok'",
+                "timeout_ms": 5000,
+            })).await;
+            assert_eq!(executed["operation_id"], "stdio-op-1");
+            assert_eq!(executed["state"], "succeeded");
+
+            let status = call(&client, "operation_status", serde_json::json!({
+                "session_id": session_id,
+                "operation_id": "stdio-op-1",
+            })).await;
+            assert_eq!(status["state"], "succeeded");
+
+            let disconnected = call(&client, "session_disconnect", serde_json::json!({
+                "session_id": session_id,
+            })).await;
+            assert_eq!(disconnected["connection"], "disconnected");
+
+            client.cancel().await.unwrap();
+            share.shutdown().await.unwrap();
         }
     }
 }

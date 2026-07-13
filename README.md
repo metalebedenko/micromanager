@@ -48,6 +48,19 @@ micromanager telegram [--nl]          # управление своим комп
 
 По умолчанию связка одноразовая. `listen --remember` включает постоянный доступ: B хранит стабильную криптоличность + allowlist спаренных друзей, и друг переподключается без нового кода (`connect --resume`). Отозвать — `forget`.
 
+### MCP API удалённых сессий
+
+`micromanager serve` публикует стабильные, адресуемые по `session_id` инструменты: `session_connect`, `session_status`, `session_journal`, `session_note_append`, `remote_exec`, `operation_status`, `operation_output`, `session_disconnect`. Подключение не меняет список MCP tools.
+
+До версии 1.0 старый relay API удалён с намеренным breaking change:
+
+| Старый tool | Замена |
+|---|---|
+| `mm_connect` | `session_connect` |
+| `mm_remote_tools` | Удалён: список stable tools фиксирован при старте |
+| `mm_remote_call` | `remote_exec`, затем `operation_status` / `operation_output` |
+| `mm_disconnect` | `session_disconnect` |
+
 ## Безопасность
 
 Каждое действие проходит многослойный гейт **до** исполнения:
