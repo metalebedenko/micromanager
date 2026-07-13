@@ -61,6 +61,29 @@ pub fn state_path(name: &str) -> PathBuf {
     state_dir().join(name)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidSessionId;
+
+impl std::fmt::Display for InvalidSessionId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("session_id must contain only ASCII letters, digits, '-' or '_'")
+    }
+}
+
+impl std::error::Error for InvalidSessionId {}
+
+/// Pure resolver for a session directory under the per-user state directory.
+pub fn session_dir(session_id: &str) -> Result<PathBuf, InvalidSessionId> {
+    if session_id.is_empty()
+        || !session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(InvalidSessionId);
+    }
+    Ok(state_path("sessions").join(session_id))
+}
+
 /// Все файлы состояния (для одноразовой миграции легаси в `init`).
 const STATE_FILES: &[&str] = &[
     "identity.json",
@@ -162,5 +185,16 @@ mod tests {
         assert_eq!(p, dir.path().join("config.json"));
         assert_eq!(std::fs::read(&p).unwrap(), b"C");
         assert!(!dir.path().join("micromanager.config.json").exists());
+    }
+
+    #[test]
+    fn session_dir_accepts_opaque_safe_ids_only() {
+        assert_eq!(
+            session_dir("abc-123_X").unwrap(),
+            state_path("sessions").join("abc-123_X")
+        );
+        assert!(session_dir("../escape").is_err());
+        assert!(session_dir("").is_err());
+        assert!(session_dir("has/slash").is_err());
     }
 }

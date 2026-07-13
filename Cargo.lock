@@ -1080,6 +1080,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2148,6 +2158,7 @@ dependencies = [
  "chacha20poly1305",
  "clap",
  "directories",
+ "fs2",
  "iroh",
  "rand 0.9.4",
  "ratatui",

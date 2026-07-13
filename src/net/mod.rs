@@ -12,9 +12,11 @@ pub(crate) mod keyfile;
 mod listen;
 mod local;
 mod peers;
+pub mod protocol;
 mod remote;
 mod runner;
 pub(crate) mod session;
+pub mod session_store;
 pub(crate) mod store;
 
 pub use auth::{Gatekeeper, HandshakeOutcome, PROTOCOL_VERSION};
