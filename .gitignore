@@ -20,3 +20,4 @@ micromanager.hosts.json
 
 # локальные артефакты редактора / агента
 .claude/
+.worktrees/
