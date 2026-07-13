@@ -21,6 +21,7 @@ schemars = "1.2.1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 iroh = "1.0.0"        # P2P-транспорт (dial-by-key сквозь NAT)
 rand = "0.9"          # одноразовый pairing-секрет
+sha2 = "0.11"         # hash controller resume-token на стороне share
 # unstable-rendered-line-info: Paragraph::line_count — реальное число строк после wrap (скролл).
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 directories = "6"     # платформенная папка состояния

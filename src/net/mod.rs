@@ -6,6 +6,7 @@ mod allowlist;
 // эти примитивы (handshake/идентичность/store/serve_hands_with), как и headless listen.
 pub(crate) mod auth;
 mod connect;
+pub mod controller;
 mod grant;
 pub(crate) mod identity;
 pub(crate) mod keyfile;
@@ -22,6 +23,7 @@ pub(crate) mod store;
 
 pub use auth::{Gatekeeper, HandshakeOutcome, PROTOCOL_VERSION};
 pub use connect::run_connect;
+pub use controller::{ControllerError, SessionController};
 pub use grant::GrantSummary;
 pub use listen::run_listen;
 pub use peers::KnownPeer;

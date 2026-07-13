@@ -8,13 +8,16 @@ use iroh::endpoint::presets;
 use iroh::{endpoint::Connection, Endpoint};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 use crate::net::auth::{
     client_handshake, server_share_handshake, HandshakeOutcome, ShareAuthenticator,
 };
+use crate::net::controller::{AcquireError, LeaseManager, CONTROLLER_LEASE_SECS};
 use crate::net::protocol::{
-    LeaseMeta, OperationRecord, OperationState, ShareSessionMeta, SESSION_SCHEMA,
+    AcquireLease, LeaseGrant, LeaseMeta, OperationRecord, OperationState, SessionMeta,
+    ShareSessionMeta, SESSION_SCHEMA,
 };
 use crate::net::session_store::{SessionStore, StoreError};
 use crate::server::executor::{ExecRequest, Executor, TerminalObserver, WaitOutcome};
@@ -48,7 +51,12 @@ pub enum ShareError {
     Store(StoreError),
     Executor(String),
     Transport(String),
+    Remote(String),
+    RemoteStorage(String),
+    QueueFull,
     ReplyLost,
+    Busy { expires_at_unix: u64 },
+    OperationNotFound(String),
 }
 
 impl std::fmt::Display for ShareError {
@@ -60,7 +68,18 @@ impl std::fmt::Display for ShareError {
             Self::Store(error) => error.fmt(formatter),
             Self::Executor(message) => write!(formatter, "executor error: {message}"),
             Self::Transport(message) => write!(formatter, "share transport error: {message}"),
+            Self::Remote(message) => write!(formatter, "share remote error: {message}"),
+            Self::RemoteStorage(message) => {
+                write!(formatter, "share remote storage unavailable: {message}")
+            }
+            Self::QueueFull => formatter.write_str("share operation queue is full"),
             Self::ReplyLost => formatter.write_str("operation reply channel closed"),
+            Self::Busy { expires_at_unix } => {
+                write!(formatter, "share session is busy until {expires_at_unix}")
+            }
+            Self::OperationNotFound(operation_id) => {
+                write!(formatter, "operation {operation_id} not found")
+            }
         }
     }
 }
@@ -79,6 +98,8 @@ pub struct ShareService {
 
 pub struct ShareClient {
     session_id: String,
+    resume_token: String,
+    lease_grant: LeaseGrant,
     streams: tokio::sync::Mutex<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream)>,
     _endpoint: Endpoint,
     _connection: Connection,
@@ -95,6 +116,7 @@ struct ShareInner {
     authenticator: Arc<ShareAuthenticator>,
     accept_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     drop_next_operation_reply: AtomicBool,
+    drop_next_lease_reply: AtomicBool,
     lifecycle: tokio::sync::Mutex<()>,
     owners: AtomicUsize,
     cleanup_started: AtomicBool,
@@ -102,12 +124,18 @@ struct ShareInner {
     cleanup_notify: tokio::sync::Notify,
     connection_slots: Arc<tokio::sync::Semaphore>,
     runtime: tokio::runtime::Handle,
+    lease: Mutex<LeaseManager>,
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    default_controller_id: String,
+    default_resume_token: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 enum WireRequest {
+    AcquireLease(AcquireLease),
     Execute(OperationRequest),
     Status { operation_id: String },
+    Disconnect { resume_token: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -115,6 +143,12 @@ enum WireReply {
     Hello { session_id: String },
     Operation(OperationReply),
     Error { message: String },
+    LeaseGranted(LeaseGrant),
+    SessionBusy { expires_at_unix: u64 },
+    OperationNotFound { operation_id: String },
+    StorageUnavailable { message: String },
+    QueueFull,
+    Disconnected,
 }
 
 pub async fn run_share() -> anyhow::Result<()> {
@@ -158,6 +192,14 @@ impl ShareService {
         sessions_dir: &Path,
         observer: Arc<dyn TerminalObserver>,
     ) -> Result<Self, ShareError> {
+        Self::start_with_clock(sessions_dir, observer, Arc::new(now_unix)).await
+    }
+
+    pub(crate) async fn start_with_clock(
+        sessions_dir: &Path,
+        observer: Arc<dyn TerminalObserver>,
+        clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Result<Self, ShareError> {
         reconcile_abandoned_sessions(sessions_dir)?;
         let session_id = random_token(24);
         let session_dir = sessions_dir.join(&session_id);
@@ -192,6 +234,7 @@ impl ShareService {
             authenticator: Arc::new(ShareAuthenticator::new(secret)),
             accept_task: Mutex::new(None),
             drop_next_operation_reply: AtomicBool::new(false),
+            drop_next_lease_reply: AtomicBool::new(false),
             lifecycle: tokio::sync::Mutex::new(()),
             owners: AtomicUsize::new(1),
             cleanup_started: AtomicBool::new(false),
@@ -199,6 +242,14 @@ impl ShareService {
             cleanup_notify: tokio::sync::Notify::new(),
             connection_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
             runtime: tokio::runtime::Handle::current(),
+            lease: Mutex::new(LeaseManager::restore(
+                CONTROLLER_LEASE_SECS,
+                &LeaseMeta::default(),
+                None,
+            )),
+            clock,
+            default_controller_id: random_token(24),
+            default_resume_token: random_resume_token(),
         });
         let task = tokio::spawn(accept_loop(Arc::clone(&inner)));
         *inner
@@ -221,7 +272,12 @@ impl ShareService {
         if !self.inner.active.load(Ordering::SeqCst) {
             return Err(ShareError::Inactive);
         }
-        ShareClient::connect(invitation).await
+        ShareClient::connect_with_credentials(
+            invitation,
+            &self.inner.default_controller_id,
+            &self.inner.default_resume_token,
+        )
+        .await
     }
 
     pub fn operation_status(&self, operation_id: &str) -> Result<OperationRecord, ShareError> {
@@ -229,9 +285,16 @@ impl ShareService {
     }
 
     #[cfg(test)]
-    fn test_drop_next_operation_reply(&self) {
+    pub(crate) fn test_drop_next_operation_reply(&self) {
         self.inner
             .drop_next_operation_reply
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_drop_next_lease_reply(&self) {
+        self.inner
+            .drop_next_lease_reply
             .store(true, Ordering::SeqCst);
     }
 
@@ -350,6 +413,32 @@ fn shutdown_terminal_state(termination_failed: bool) -> (OperationState, &'stati
 
 impl ShareClient {
     pub async fn connect(invitation: &str) -> Result<Self, ShareError> {
+        Self::connect_with_credentials(invitation, &random_token(24), &random_resume_token()).await
+    }
+
+    pub async fn connect_with_credentials(
+        invitation: &str,
+        controller_id: &str,
+        resume_token: &str,
+    ) -> Result<Self, ShareError> {
+        Self::connect_with_credentials_and_hello(
+            invitation,
+            controller_id,
+            resume_token,
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_with_credentials_and_hello<F>(
+        invitation: &str,
+        controller_id: &str,
+        resume_token: &str,
+        on_hello: F,
+    ) -> Result<Self, ShareError>
+    where
+        F: FnOnce(&str) -> Result<(), ShareError>,
+    {
         let invite =
             crate::net::decode_invite(invitation).map_err(|_| ShareError::InvalidInvitation)?;
         let endpoint = Endpoint::bind(presets::Minimal).await.map_err(transport)?;
@@ -371,8 +460,31 @@ impl ShareClient {
                 "share did not send session hello".into(),
             ));
         };
+        on_hello(&session_id)?;
+        write_frame(
+            &mut send,
+            &WireRequest::AcquireLease(AcquireLease {
+                controller_id: controller_id.to_owned(),
+                resume_token: resume_token.to_owned(),
+            }),
+        )
+        .await?;
+        let lease_grant = match read_frame(&mut recv).await? {
+            WireReply::LeaseGranted(grant) => grant,
+            WireReply::SessionBusy { expires_at_unix } => {
+                return Err(ShareError::Busy { expires_at_unix });
+            }
+            WireReply::Error { message } => return Err(ShareError::Remote(message)),
+            WireReply::StorageUnavailable { message } => {
+                return Err(ShareError::RemoteStorage(message));
+            }
+            WireReply::QueueFull => return Err(ShareError::QueueFull),
+            _ => return Err(ShareError::Transport("unexpected lease reply".into())),
+        };
         Ok(Self {
             session_id,
+            resume_token: resume_token.to_owned(),
+            lease_grant,
             streams: tokio::sync::Mutex::new((send, recv)),
             _endpoint: endpoint,
             _connection: connection,
@@ -383,14 +495,25 @@ impl ShareClient {
         &self.session_id
     }
 
+    pub fn lease_grant(&self) -> &LeaseGrant {
+        &self.lease_grant
+    }
+
     pub async fn execute(&self, request: OperationRequest) -> Result<OperationReply, ShareError> {
         let reply = self.call(WireRequest::Execute(request)).await?;
         match reply {
             WireReply::Operation(reply) => Ok(reply),
-            WireReply::Error { message } => Err(ShareError::Transport(message)),
+            WireReply::Error { message } => Err(ShareError::Remote(message)),
+            WireReply::SessionBusy { expires_at_unix } => Err(ShareError::Busy { expires_at_unix }),
+            WireReply::OperationNotFound { operation_id } => {
+                Err(ShareError::OperationNotFound(operation_id))
+            }
+            WireReply::StorageUnavailable { message } => Err(ShareError::RemoteStorage(message)),
+            WireReply::QueueFull => Err(ShareError::QueueFull),
             WireReply::Hello { .. } => {
                 Err(ShareError::Transport("unexpected session hello".into()))
             }
+            _ => Err(ShareError::Transport("unexpected operation reply".into())),
         }
     }
 
@@ -405,10 +528,36 @@ impl ShareClient {
             .await?;
         match reply {
             WireReply::Operation(reply) => Ok(reply.record),
-            WireReply::Error { message } => Err(ShareError::Transport(message)),
+            WireReply::Error { message } => Err(ShareError::Remote(message)),
+            WireReply::SessionBusy { expires_at_unix } => Err(ShareError::Busy { expires_at_unix }),
+            WireReply::OperationNotFound { operation_id } => {
+                Err(ShareError::OperationNotFound(operation_id))
+            }
+            WireReply::StorageUnavailable { message } => Err(ShareError::RemoteStorage(message)),
+            WireReply::QueueFull => Err(ShareError::QueueFull),
             WireReply::Hello { .. } => {
                 Err(ShareError::Transport("unexpected session hello".into()))
             }
+            _ => Err(ShareError::Transport("unexpected status reply".into())),
+        }
+    }
+
+    pub async fn disconnect(&self) -> Result<(), ShareError> {
+        let mut streams = self.streams.lock().await;
+        write_frame(
+            &mut streams.0,
+            &WireRequest::Disconnect {
+                resume_token: self.resume_token.clone(),
+            },
+        )
+        .await?;
+        streams.0.finish().map_err(transport)?;
+        match read_frame(&mut streams.1).await? {
+            WireReply::Disconnected => Ok(()),
+            WireReply::Error { message } => Err(ShareError::Remote(message)),
+            WireReply::StorageUnavailable { message } => Err(ShareError::RemoteStorage(message)),
+            WireReply::QueueFull => Err(ShareError::QueueFull),
+            _ => Err(ShareError::Transport("unexpected disconnect reply".into())),
         }
     }
 
@@ -460,25 +609,85 @@ async fn handle_connection(
         },
     )
     .await?;
+    let acquire: WireRequest = tokio::time::timeout(IDLE_FRAME_TIMEOUT, read_frame(&mut recv))
+        .await
+        .map_err(|_| ShareError::Transport("lease handshake timed out".into()))??;
+    let WireRequest::AcquireLease(credentials) = acquire else {
+        write_frame(
+            &mut send,
+            &WireReply::Error {
+                message: "lease acquisition required".into(),
+            },
+        )
+        .await?;
+        send.finish().map_err(transport)?;
+        let _ = send.stopped().await;
+        return Ok(());
+    };
+    match inner.acquire_lease(&credentials) {
+        Ok(grant) => {
+            if inner.drop_next_lease_reply.swap(false, Ordering::SeqCst) {
+                return Ok(());
+            }
+            write_frame(&mut send, &WireReply::LeaseGranted(grant)).await?;
+        }
+        Err(ShareError::Busy { expires_at_unix }) => {
+            write_frame(&mut send, &WireReply::SessionBusy { expires_at_unix }).await?;
+            send.finish().map_err(transport)?;
+            let _ = send.stopped().await;
+            return Ok(());
+        }
+        Err(error) => {
+            write_frame(&mut send, &share_error_reply(error)).await?;
+            send.finish().map_err(transport)?;
+            let _ = send.stopped().await;
+            return Ok(());
+        }
+    }
     loop {
         let request: WireRequest =
             match tokio::time::timeout(IDLE_FRAME_TIMEOUT, read_frame(&mut recv)).await {
                 Ok(Ok(request)) => request,
                 Ok(Err(_)) | Err(_) => return Ok(()),
             };
+        if !matches!(request, WireRequest::Disconnect { .. }) {
+            match inner.acquire_lease(&credentials) {
+                Ok(_) => {}
+                Err(ShareError::Busy { expires_at_unix }) => {
+                    write_frame(&mut send, &WireReply::SessionBusy { expires_at_unix }).await?;
+                    send.finish().map_err(transport)?;
+                    let _ = send.stopped().await;
+                    return Ok(());
+                }
+                Err(error) => {
+                    write_frame(&mut send, &share_error_reply(error)).await?;
+                    send.finish().map_err(transport)?;
+                    let _ = send.stopped().await;
+                    return Ok(());
+                }
+            }
+        }
         let reply = match request {
+            WireRequest::AcquireLease(_) => WireReply::Error {
+                message: "lease already acquired on this connection".into(),
+            },
             WireRequest::Execute(request) => match inner.execute(request).await {
                 Ok(reply) => WireReply::Operation(reply),
-                Err(error) => WireReply::Error {
-                    message: error.to_string(),
-                },
+                Err(error) => share_error_reply(error),
             },
             WireRequest::Status { operation_id } => match inner.store.operation(&operation_id) {
                 Ok(record) => WireReply::Operation(OperationReply { record }),
-                Err(error) => WireReply::Error {
-                    message: error.to_string(),
-                },
+                Err(StoreError::OperationNotFound(_)) => {
+                    WireReply::OperationNotFound { operation_id }
+                }
+                Err(error) => store_error_reply(error),
             },
+            WireRequest::Disconnect { resume_token } => {
+                match inner.disconnect_lease(&resume_token) {
+                    Ok(()) => WireReply::Disconnected,
+                    Err(error) => share_error_reply(error),
+                }
+            }
         };
         if matches!(reply, WireReply::Operation(_))
             && inner
@@ -488,10 +697,93 @@ async fn handle_connection(
             return Ok(());
         }
         write_frame(&mut send, &reply).await?;
+        if matches!(reply, WireReply::Disconnected) {
+            send.finish().map_err(transport)?;
+            let _ = send.stopped().await;
+            return Ok(());
+        }
+    }
+}
+
+fn share_error_reply(error: ShareError) -> WireReply {
+    match error {
+        ShareError::Store(error) => store_error_reply(error),
+        ShareError::RemoteStorage(message) => WireReply::StorageUnavailable { message },
+        ShareError::QueueFull => WireReply::QueueFull,
+        error => WireReply::Error {
+            message: error.to_string(),
+        },
+    }
+}
+
+fn store_error_reply(error: StoreError) -> WireReply {
+    match error {
+        StoreError::QueueFull => WireReply::QueueFull,
+        error @ (StoreError::Corrupt { .. }
+        | StoreError::UnsupportedSchema(_)
+        | StoreError::Locked
+        | StoreError::Unavailable { .. }) => WireReply::StorageUnavailable {
+            message: error.to_string(),
+        },
+        error => WireReply::Error {
+            message: error.to_string(),
+        },
     }
 }
 
 impl ShareInner {
+    fn acquire_lease(&self, credentials: &AcquireLease) -> Result<LeaseGrant, ShareError> {
+        let token_hash = hash_resume_token(&credentials.resume_token);
+        let operation_active = !self
+            .running
+            .lock()
+            .map_err(|_| ShareError::Executor("running operation registry was poisoned".into()))?
+            .is_empty();
+        let mut lease = self
+            .lease
+            .lock()
+            .map_err(|_| ShareError::Executor("controller lease lock was poisoned".into()))?;
+        let previous = lease.clone();
+        let now = (self.clock)();
+        if operation_active {
+            lease.protect_while_operation_active(now);
+        }
+        let acquire = lease.acquire(now, &credentials.controller_id, &token_hash);
+        if let Err(error) = self.persist_lease(&lease) {
+            *lease = previous;
+            return Err(error);
+        }
+        acquire
+            .map_err(|AcquireError::Busy { expires_at_unix }| ShareError::Busy { expires_at_unix })
+    }
+
+    fn disconnect_lease(&self, resume_token: &str) -> Result<(), ShareError> {
+        let token_hash = hash_resume_token(resume_token);
+        let mut lease = self
+            .lease
+            .lock()
+            .map_err(|_| ShareError::Executor("controller lease lock was poisoned".into()))?;
+        let previous = lease.clone();
+        if lease.disconnect(&token_hash) {
+            if let Err(error) = self.persist_lease(&lease) {
+                *lease = previous;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_lease(&self, lease: &LeaseManager) -> Result<(), ShareError> {
+        let (lease_meta, token_hash) = lease.snapshot();
+        let SessionMeta::Share(mut meta) = self.store.load_meta()? else {
+            return Err(ShareError::Store(StoreError::RoleMismatch));
+        };
+        meta.lease = lease_meta;
+        meta.controller_token_hash = token_hash;
+        self.store.save_meta(&SessionMeta::Share(meta))?;
+        Ok(())
+    }
+
     async fn execute(
         self: &Arc<Self>,
         request: OperationRequest,
@@ -641,6 +933,25 @@ fn random_token(length: usize) -> String {
         .take(length)
         .map(char::from)
         .collect()
+}
+
+fn random_resume_token() -> String {
+    use base64::Engine;
+    let bytes: [u8; 32] = rand::random();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn hash_resume_token(token: &str) -> String {
+    use base64::Engine;
+    let digest = Sha256::digest(token.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn reconcile_abandoned_sessions(sessions_dir: &Path) -> Result<(), ShareError> {

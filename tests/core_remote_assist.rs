@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use micromanager::net::protocol::OperationState;
-use micromanager::net::{OperationRequest, ShareService};
+use micromanager::net::{OperationRequest, SessionController, ShareService};
 use micromanager::server::executor::{ExecResult, TerminalObserver};
 
 struct QuietObserver;
@@ -63,6 +63,46 @@ mod core_remote_assist {
             );
             service.shutdown().await.unwrap();
             assert!(service.connect(&invite).await.is_err());
+        }
+    }
+
+    pub mod controller {
+        use super::*;
+
+        #[tokio::test]
+        async fn public_controller_resumes_durable_session_and_operation_status() {
+            let share_state = tempfile::tempdir().unwrap();
+            let engineer_state = tempfile::tempdir().unwrap();
+            let output = share_state.path().join("controller-acceptance.txt");
+            let service = ShareService::start(share_state.path(), Arc::new(QuietObserver))
+                .await
+                .unwrap();
+            let controller =
+                SessionController::connect(engineer_state.path(), service.invitation())
+                    .await
+                    .unwrap();
+            let operation = OperationRequest {
+                session_id: String::new(),
+                operation_id: "controller-acceptance-op-1".into(),
+                command: append_command(&output),
+                cwd: None,
+                timeout: Duration::from_secs(5),
+            };
+
+            let completed = controller.execute(operation).await.unwrap();
+            let session_dir = controller.session_dir().to_owned();
+            drop(controller);
+            let resumed = SessionController::resume(&session_dir).await.unwrap();
+            let restored = resumed
+                .operation_status("controller-acceptance-op-1")
+                .await
+                .unwrap();
+
+            assert_eq!(restored, completed.record);
+            assert_eq!(restored.state, OperationState::Succeeded);
+            assert_eq!(std::fs::read_to_string(output).unwrap(), "once\n");
+            resumed.disconnect().await.unwrap();
+            service.shutdown().await.unwrap();
         }
     }
 }

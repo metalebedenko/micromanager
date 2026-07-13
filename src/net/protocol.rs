@@ -9,6 +9,18 @@ pub struct LeaseMeta {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcquireLease {
+    pub controller_id: String,
+    pub resume_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseGrant {
+    pub controller_id: String,
+    pub expires_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EngineerSessionMeta {
     pub schema: u32,
     pub session_id: String,
