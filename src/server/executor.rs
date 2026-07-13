@@ -241,18 +241,29 @@ impl Executor {
             .active
             .lock()
             .map_err(|_| ExecError::Shutdown("active process registry was poisoned".into()))?
-            .values()
-            .cloned()
+            .iter()
+            .map(|(id, process)| (*id, Arc::clone(process)))
             .collect();
-        for process in processes {
-            terminate_process_group(&process).await?;
+        let mut errors = Vec::new();
+        for (id, process) in processes {
+            match terminate_process_group(&process).await {
+                Ok(()) => {
+                    self.inner
+                        .active
+                        .lock()
+                        .map_err(|_| {
+                            ExecError::Shutdown("active process registry was poisoned".into())
+                        })?
+                        .remove(&id);
+                }
+                Err(error) => errors.push(format!("process {id}: {error}")),
+            }
         }
-        self.inner
-            .active
-            .lock()
-            .map_err(|_| ExecError::Shutdown("active process registry was poisoned".into()))?
-            .clear();
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ExecError::Shutdown(errors.join("; ")))
+        }
     }
 }
 

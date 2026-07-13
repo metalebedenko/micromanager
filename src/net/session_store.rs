@@ -230,12 +230,72 @@ impl SessionStore {
         Ok(state.operations.get(id).cloned().unwrap_or(record))
     }
 
+    /// Atomically finish a non-terminal operation, or return the terminal
+    /// record already committed by a concurrent completion/shutdown path.
+    pub fn finish_if_nonterminal(
+        &self,
+        id: &str,
+        terminal: OperationState,
+        summary: &str,
+        output: &str,
+    ) -> Result<OperationRecord, StoreError> {
+        let mut state = self.lock_state()?;
+        ensure_writable(&state, &self.dir)?;
+        let mut record = state
+            .operations
+            .get(id)
+            .cloned()
+            .ok_or_else(|| StoreError::OperationNotFound(id.to_owned()))?;
+        if record.state.is_terminal() {
+            return Ok(record);
+        }
+        let (output, truncated) = clip_utf8(output, MAX_OPERATION_OUTPUT_BYTES);
+        record.finish(terminal, summary, output, now_unix())?;
+        record.output_truncated = truncated;
+        self.append_or_poison(&mut state, &record)?;
+        if let Some(previous) = state.operations.insert(id.to_owned(), record.clone()) {
+            state.output_bytes = state.output_bytes.saturating_sub(output_len(&previous));
+        }
+        state.output_bytes += output_len(&record);
+        self.prune_outputs(&mut state, MAX_SESSION_OUTPUT_BYTES)?;
+        Ok(state.operations.get(id).cloned().unwrap_or(record))
+    }
+
     pub fn operation(&self, id: &str) -> Result<OperationRecord, StoreError> {
         self.lock_state()?
             .operations
             .get(id)
             .cloned()
             .ok_or_else(|| StoreError::OperationNotFound(id.to_owned()))
+    }
+
+    /// Terminalise operations left without a provable live process after a
+    /// share-process restart. They remain in the exactly-once ledger and can
+    /// never be replayed under the same operation id.
+    pub fn reconcile_unfinished(&self) -> Result<Vec<OperationRecord>, StoreError> {
+        let unfinished: Vec<_> = self
+            .lock_state()?
+            .operations
+            .values()
+            .filter(|record| !record.state.is_terminal())
+            .map(|record| (record.id.clone(), record.state))
+            .collect();
+        let mut reconciled = Vec::with_capacity(unfinished.len());
+        for (id, state) in unfinished {
+            let (terminal, summary) = match state {
+                OperationState::Queued => (
+                    OperationState::Cancelled,
+                    "[error] cancelled before execution after share restart",
+                ),
+                OperationState::Running => (
+                    OperationState::Interrupted,
+                    "[error] interrupted: process survival could not be proven",
+                ),
+                _ => continue,
+            };
+            reconciled.push(self.finish_operation(&id, terminal, summary, "")?);
+        }
+        Ok(reconciled)
     }
 
     pub fn total_output_bytes(&self) -> usize {

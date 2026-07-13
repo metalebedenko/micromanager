@@ -15,6 +15,7 @@ mod peers;
 pub mod protocol;
 mod remote;
 mod runner;
+pub mod share;
 pub(crate) mod session;
 pub mod session_store;
 pub(crate) mod store;
@@ -29,6 +30,7 @@ pub(crate) use remote::short_id;
 #[cfg(test)]
 pub(crate) use remote::{loopback_session_with_confirmer, loopback_session_with_probe};
 pub use runner::{map_tool, McpCaller, McpHandle, McpToolRunner};
+pub use share::{run_share, OperationReply, OperationRequest, ShareClient, ShareService};
 pub use session::{Grant, ReportTo};
 
 use iroh::EndpointAddr;

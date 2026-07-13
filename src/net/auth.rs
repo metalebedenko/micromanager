@@ -54,6 +54,32 @@ pub struct Gatekeeper {
     persist_path: Option<PathBuf>,
 }
 
+/// Session-scoped authenticator for `mm share`. Unlike pairing, the same
+/// invitation remains valid for reconnects until the owning share process
+/// explicitly revokes it.
+pub struct ShareAuthenticator {
+    secret: String,
+    active: AtomicBool,
+}
+
+impl ShareAuthenticator {
+    pub fn new(secret: impl Into<String>) -> Self {
+        Self {
+            secret: secret.into(),
+            active: AtomicBool::new(true),
+        }
+    }
+
+    pub fn authorize(&self, presented: &str) -> bool {
+        self.active.load(Ordering::SeqCst)
+            && ct_eq(self.secret.as_bytes(), presented.as_bytes())
+    }
+
+    pub fn revoke(&self) {
+        self.active.store(false, Ordering::SeqCst);
+    }
+}
+
 impl Gatekeeper {
     pub fn new(secret: impl Into<String>) -> Self {
         Self {
@@ -264,6 +290,37 @@ where
     }
 }
 
+/// Reusable-invitation handshake for a live `mm share` session.
+pub async fn server_share_handshake<R, W>(
+    recv: &mut R,
+    send: &mut W,
+    auth: &ShareAuthenticator,
+) -> Result<bool>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let line = read_line(recv).await?;
+    match parse_client_hello(&line) {
+        Some((version, secret)) if version == PROTOCOL_VERSION => {
+            let accepted = auth.authorize(&secret);
+            if accepted {
+                send.write_all(b"OK {}\n").await?;
+            } else {
+                send.write_all(b"NO\n").await?;
+            }
+            send.flush().await?;
+            Ok(accepted)
+        }
+        _ => {
+            send.write_all(format!("VERS {PROTOCOL_VERSION}\n").as_bytes())
+                .await?;
+            send.flush().await?;
+            Ok(false)
+        }
+    }
+}
+
 /// A-сторона рукопожатия: предъявить MM/<ver> + секрет, дождаться OK/NO/VERS.
 pub async fn client_handshake<R, W>(
     send: &mut W,
@@ -283,6 +340,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn share_authenticator_reuses_secret_until_explicit_revoke() {
+        let auth = ShareAuthenticator::new("session-secret");
+        assert!(auth.authorize("session-secret"));
+        assert!(auth.authorize("session-secret"));
+        assert!(!auth.authorize("wrong"));
+        auth.revoke();
+        assert!(!auth.authorize("session-secret"));
+    }
 
     fn id() -> EndpointId {
         iroh::SecretKey::generate().public()

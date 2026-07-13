@@ -19,6 +19,9 @@ struct Cli {
 enum Command {
     /// Запустить MCP-сервер «руки» по stdio (для подключения MCP-клиентом).
     Serve,
+    /// Дать инженеру полный терминальный доступ на время жизни этого процесса.
+    /// Код остаётся тем же при реконнектах; Ctrl-C отзывает его и завершает команды.
+    Share,
     /// Выполнить задачу естественным языком через LLM,
     /// которая сама рулит «руками».
     Agent {
@@ -272,6 +275,7 @@ async fn main() -> anyhow::Result<()> {
     micromanager::paths::init();
     match cli.command {
         Command::Serve => micromanager::server::run_stdio().await,
+        Command::Share => micromanager::net::run_share().await,
         Command::Agent { task, model, provider } => {
             // reqwest blocking нельзя крутить в async-рантайме → отдельный поток.
             let answer = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
@@ -470,6 +474,12 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_accepts_share_role() {
+        let cli = Cli::try_parse_from(["micromanager", "share"]).unwrap();
+        assert!(matches!(cli.command, Command::Share));
+    }
 
     // Оба теста изменяют env: держим их в одном модуле и сериализуем через Mutex
     // (без внешнего crate serial_test — только std).
