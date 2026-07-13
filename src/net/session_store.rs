@@ -9,8 +9,8 @@ use fs2::FileExt;
 
 use super::protocol::ProtocolError;
 pub use super::protocol::{
-    EngineerSessionMeta, LeaseMeta, OperationRecord, OperationState, SessionMeta, ShareSessionMeta,
-    SESSION_SCHEMA,
+    EngineerSessionMeta, LeaseMeta, OperationCapture, OperationRecord, OperationState, SessionMeta,
+    ShareSessionMeta, SESSION_SCHEMA,
 };
 use super::store::write_private;
 
@@ -94,6 +94,12 @@ pub struct SessionStore {
 pub struct StoreStatus {
     pub queue_len: usize,
     pub last_operation: Option<OperationRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AllocatedOperation {
+    pub record: OperationRecord,
+    pub duplicate: bool,
 }
 
 impl SessionStore {
@@ -192,6 +198,53 @@ impl SessionStore {
         Ok(record)
     }
 
+    pub fn begin_allocated_operation(
+        &self,
+        request_key: Option<&str>,
+        command: &str,
+    ) -> Result<AllocatedOperation, StoreError> {
+        let mut state = self.lock_state()?;
+        ensure_writable(&state, &self.dir)?;
+        if let Some(existing) = request_key.and_then(|key| {
+            state
+                .operations
+                .values()
+                .find(|record| record.request_key.as_deref() == Some(key))
+        }) {
+            return Ok(AllocatedOperation {
+                record: existing.clone(),
+                duplicate: true,
+            });
+        }
+        let queued = state
+            .operations
+            .values()
+            .filter(|record| record.state == OperationState::Queued)
+            .count();
+        if queued >= MAX_QUEUED_OPERATIONS {
+            return Err(StoreError::QueueFull);
+        }
+        let next = state
+            .operations
+            .keys()
+            .filter_map(|id| id.strip_prefix("op-")?.parse::<u64>().ok())
+            .max()
+            .unwrap_or_default()
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Unavailable {
+                path: self.dir.clone(),
+                message: "operation id sequence exhausted".into(),
+            })?;
+        let mut record = OperationRecord::queued(format!("op-{next:020}"), command, now_unix());
+        record.request_key = request_key.map(str::to_owned);
+        self.append_or_poison(&mut state, &record)?;
+        state.operations.insert(record.id.clone(), record.clone());
+        Ok(AllocatedOperation {
+            record,
+            duplicate: false,
+        })
+    }
+
     pub fn mark_running(&self, id: &str) -> Result<OperationRecord, StoreError> {
         let mut state = self.lock_state()?;
         ensure_writable(&state, &self.dir)?;
@@ -236,6 +289,29 @@ impl SessionStore {
         Ok(state.operations.get(id).cloned().unwrap_or(record))
     }
 
+    pub fn finish_operation_detailed(
+        &self,
+        id: &str,
+        terminal: OperationState,
+        summary: &str,
+        stdout: &str,
+        stderr: &str,
+        output_truncated: bool,
+    ) -> Result<OperationRecord, StoreError> {
+        self.finish_detailed(
+            id,
+            terminal,
+            summary,
+            OperationCapture {
+                output: String::new(),
+                stdout: stdout.to_owned(),
+                stderr: stderr.to_owned(),
+                truncated: output_truncated,
+            },
+            false,
+        )
+    }
+
     /// Atomically finish a non-terminal operation, or return the terminal
     /// record already committed by a concurrent completion/shutdown path.
     pub fn finish_if_nonterminal(
@@ -258,6 +334,76 @@ impl SessionStore {
         let (output, truncated) = clip_utf8(output, MAX_OPERATION_OUTPUT_BYTES);
         record.finish(terminal, summary, output, now_unix())?;
         record.output_truncated = truncated;
+        self.append_or_poison(&mut state, &record)?;
+        if let Some(previous) = state.operations.insert(id.to_owned(), record.clone()) {
+            state.output_bytes = state.output_bytes.saturating_sub(output_len(&previous));
+        }
+        state.output_bytes += output_len(&record);
+        self.prune_outputs(&mut state, MAX_SESSION_OUTPUT_BYTES)?;
+        Ok(state.operations.get(id).cloned().unwrap_or(record))
+    }
+
+    pub fn finish_if_nonterminal_detailed(
+        &self,
+        id: &str,
+        terminal: OperationState,
+        summary: &str,
+        stdout: &str,
+        stderr: &str,
+        output_truncated: bool,
+    ) -> Result<OperationRecord, StoreError> {
+        self.finish_detailed(
+            id,
+            terminal,
+            summary,
+            OperationCapture {
+                output: String::new(),
+                stdout: stdout.to_owned(),
+                stderr: stderr.to_owned(),
+                truncated: output_truncated,
+            },
+            true,
+        )
+    }
+
+    fn finish_detailed(
+        &self,
+        id: &str,
+        terminal: OperationState,
+        summary: &str,
+        capture: OperationCapture,
+        only_nonterminal: bool,
+    ) -> Result<OperationRecord, StoreError> {
+        let mut state = self.lock_state()?;
+        ensure_writable(&state, &self.dir)?;
+        let mut record = state
+            .operations
+            .get(id)
+            .cloned()
+            .ok_or_else(|| StoreError::OperationNotFound(id.to_owned()))?;
+        if only_nonterminal && record.state.is_terminal() {
+            return Ok(record);
+        }
+        let (stdout, stderr, clipped) = clip_streams(
+            &capture.stdout,
+            &capture.stderr,
+            MAX_OPERATION_OUTPUT_BYTES,
+        );
+        let (combined, combined_clipped) = clip_utf8(
+            &combine_output(&stdout, &stderr),
+            MAX_OPERATION_OUTPUT_BYTES,
+        );
+        record.finish_detailed(
+            terminal,
+            summary,
+            OperationCapture {
+                output: combined,
+                stdout,
+                stderr,
+                truncated: capture.truncated || clipped || combined_clipped,
+            },
+            now_unix(),
+        )?;
         self.append_or_poison(&mut state, &record)?;
         if let Some(previous) = state.operations.insert(id.to_owned(), record.clone()) {
             state.output_bytes = state.output_bytes.saturating_sub(output_len(&previous));
@@ -328,6 +474,13 @@ impl SessionStore {
         })
     }
 
+    pub fn verify_durable(&self) -> Result<(), StoreError> {
+        let (_, meta) = read_meta(&self.dir)?;
+        validate_meta(&meta, &self.dir)?;
+        load_ledger(&self.dir)?;
+        Ok(())
+    }
+
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, StoreState>, StoreError> {
         self.state.lock().map_err(|_| StoreError::Unavailable {
             path: self.dir.clone(),
@@ -392,6 +545,8 @@ impl SessionStore {
                     })?;
             state.output_bytes = state.output_bytes.saturating_sub(output_len(&record));
             record.output = None;
+            record.stdout.clear();
+            record.stderr.clear();
             record.output_pruned = true;
             record.updated_at_unix = now_unix();
             self.append_or_poison(state, &record)?;
@@ -582,6 +737,7 @@ fn validate_ledger_record(
             None => next.state == OperationState::Queued,
             Some(previous) if previous.state.is_terminal() && next.state == previous.state => {
                 previous.command == next.command
+                    && previous.request_key == next.request_key
                     && previous.created_at_unix == next.created_at_unix
                     && next.updated_at_unix >= previous.updated_at_unix
                     && previous.output.is_some()
@@ -595,6 +751,7 @@ fn validate_ledger_record(
                     .is_ok()
                     && expected.state == next.state
                     && previous.command == next.command
+                    && previous.request_key == next.request_key
                     && previous.created_at_unix == next.created_at_unix
                     && next.updated_at_unix >= previous.updated_at_unix
             }
@@ -620,6 +777,8 @@ fn valid_record_snapshot(record: &OperationRecord) -> bool {
         OperationState::Queued | OperationState::Running => {
             record.summary.is_none()
                 && record.output.is_none()
+                && record.stdout.is_empty()
+                && record.stderr.is_empty()
                 && !record.output_truncated
                 && !record.output_pruned
                 && record.finished_at_unix.is_none()
@@ -635,7 +794,26 @@ fn valid_record_snapshot(record: &OperationRecord) -> bool {
 }
 
 fn output_len(record: &OperationRecord) -> usize {
-    record.output.as_deref().map_or(0, str::len)
+    if record.stdout.is_empty() && record.stderr.is_empty() {
+        record.output.as_deref().map_or(0, str::len)
+    } else {
+        record.stdout.len().saturating_add(record.stderr.len())
+    }
+}
+
+fn clip_streams(stdout: &str, stderr: &str, max_bytes: usize) -> (String, String, bool) {
+    let (stdout, stdout_clipped) = clip_utf8(stdout, max_bytes);
+    let remaining = max_bytes.saturating_sub(stdout.len());
+    let (stderr, stderr_clipped) = clip_utf8(stderr, remaining);
+    (stdout, stderr, stdout_clipped || stderr_clipped)
+}
+
+fn combine_output(stdout: &str, stderr: &str) -> String {
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (_, true) => stdout.to_owned(),
+        (true, false) => stderr.to_owned(),
+        (false, false) => format!("{stdout}\n[stderr]\n{stderr}"),
+    }
 }
 
 fn ensure_writable(state: &StoreState, dir: &Path) -> Result<(), StoreError> {
@@ -724,6 +902,26 @@ mod tests {
             reopened.load_meta().unwrap(),
             SessionMeta::Share(_)
         ));
+    }
+
+    #[test]
+    fn allocated_operation_drives_queue_and_last_operation_status() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("session-1");
+        let store = SessionStore::create_engineer(&dir, engineer_meta("session-1")).unwrap();
+        let allocated = store
+            .begin_allocated_operation(Some("request-a"), "echo queued")
+            .unwrap();
+
+        let queued = store.status().unwrap();
+        assert_eq!(queued.queue_len, 1);
+        assert_eq!(queued.last_operation.as_ref().unwrap().id, allocated.record.id);
+        assert_eq!(queued.last_operation.unwrap().state, OperationState::Queued);
+
+        store.mark_running(&allocated.record.id).unwrap();
+        let running = store.status().unwrap();
+        assert_eq!(running.queue_len, 0);
+        assert_eq!(running.last_operation.unwrap().state, OperationState::Running);
     }
 
     #[test]

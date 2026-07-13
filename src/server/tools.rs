@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audit::{self, Audit, AuditEntry, FileAudit};
 use crate::net::protocol::{OperationRecord, OperationState};
-use crate::net::{ControllerError, OperationRequest, SessionRegistry};
+use crate::net::{ControllerError, SessionRegistry};
 use crate::safety::{
     authorize, decide, gate, Action, ActionKind, Confirmer, GateError, Policy, StdinConfirmer,
     Verdict,
@@ -335,6 +335,7 @@ pub struct RemoteExecParams {
     pub command: String,
     pub cwd: Option<PathBuf>,
     pub timeout_ms: Option<u64>,
+    pub caller_timeout_ms: Option<u64>,
 }
 #[derive(Deserialize, JsonSchema)]
 pub struct OperationParams {
@@ -569,16 +570,32 @@ impl HandsServer {
     ) -> Result<Json<RemoteExecOutput>, ErrorData> {
         self.relay_guard()?;
         let controller = self.sessions.get(&params.session_id).await.map_err(controller_error)?;
-        let operation_id = params.operation_id.unwrap_or_else(random_operation_id);
-        let reply = controller.execute(OperationRequest {
-            session_id: params.session_id,
-            operation_id: operation_id.clone(),
-            command: params.command,
-            cwd: params.cwd,
-            timeout: std::time::Duration::from_millis(params.timeout_ms.unwrap_or(30_000)),
-        }).await.map_err(controller_error)?;
+        let timeout_ms = params.timeout_ms.unwrap_or(300_000);
+        if !(1_000..=1_800_000).contains(&timeout_ms) {
+            return Err(ErrorData::invalid_request(
+                "invalid_timeout: timeout_ms must be between 1000 and 1800000".to_string(),
+                Some(serde_json::json!({ "code": "invalid_timeout" })),
+            ));
+        }
+        let caller_timeout_ms = params.caller_timeout_ms.unwrap_or(300_000);
+        if caller_timeout_ms == 0 {
+            return Err(ErrorData::invalid_request(
+                "invalid_timeout: caller_timeout_ms must be positive".to_string(),
+                Some(serde_json::json!({ "code": "invalid_timeout" })),
+            ));
+        }
+        let reply = controller
+            .execute_session_operation(
+                params.operation_id.as_deref(),
+                params.command,
+                params.cwd,
+                std::time::Duration::from_millis(timeout_ms),
+                std::time::Duration::from_millis(caller_timeout_ms),
+            )
+            .await
+            .map_err(controller_error)?;
         Ok(Json(RemoteExecOutput {
-            operation_id,
+            operation_id: reply.record.id,
             state: reply.record.state,
             summary: reply.record.summary.unwrap_or_default(),
         }))
@@ -607,11 +624,10 @@ impl HandsServer {
         self.relay_guard()?;
         let record = self.sessions.get(&session_id).await.map_err(controller_error)?
             .operation_status(&operation_id).await.map_err(controller_error)?;
-        let (stdout, stderr) = split_output(record.output.as_deref().unwrap_or_default());
         Ok(Json(OperationOutputOutput {
             operation_id: record.id,
-            stdout,
-            stderr,
+            stdout: record.stdout,
+            stderr: record.stderr,
             truncated: record.output_truncated || record.output_pruned,
         }))
     }
@@ -657,23 +673,6 @@ fn operation_state(state: OperationState) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-fn random_operation_id() -> String {
-    use rand::Rng;
-    let suffix: String = rand::rng()
-        .sample_iter(rand::distr::Alphanumeric)
-        .take(20)
-        .map(char::from)
-        .collect();
-    format!("op-{suffix}")
-}
-
-fn split_output(output: &str) -> (String, String) {
-    match output.split_once("\n[stderr]\n") {
-        Some((stdout, stderr)) => (stdout.to_owned(), stderr.to_owned()),
-        None => (output.to_owned(), String::new()),
-    }
-}
-
 async fn append_private(path: &Path, bytes: &[u8]) -> Result<(), ErrorData> {
     use tokio::io::AsyncWriteExt;
     let mut file = tokio::fs::OpenOptions::new()
@@ -712,7 +711,12 @@ fn controller_error(error: ControllerError) -> ErrorData {
         }
     };
     let message = format!("{code}: {error}");
-    let data = Some(serde_json::json!({ "code": code }));
+    let data = Some(match &error {
+        ControllerError::UnknownInProgress { operation_id } => {
+            serde_json::json!({ "code": code, "operation_id": operation_id })
+        }
+        _ => serde_json::json!({ "code": code }),
+    });
     if internal {
         ErrorData::internal_error(message, data)
     } else {
@@ -757,6 +761,38 @@ mod tests {
         fn failed(&self, _: &str, _: &str) {}
     }
 
+    #[cfg(unix)]
+    fn append_command(path: &Path, value: &str) -> String {
+        format!("printf '{value}\\n' >> '{}'", path.display())
+    }
+
+    #[cfg(unix)]
+    fn slow_success_command() -> String {
+        "sleep 0.2; printf done".into()
+    }
+
+    #[cfg(unix)]
+    fn delayed_append_command(path: &Path) -> String {
+        format!("sleep 0.15; printf 'once\\n' >> '{}'", path.display())
+    }
+
+    #[cfg(windows)]
+    fn delayed_append_command(path: &Path) -> String {
+        let path = path.display().to_string().replace('\'', "''");
+        format!("Start-Sleep -Milliseconds 150; Add-Content -LiteralPath '{path}' -Value 'once'")
+    }
+
+    #[cfg(windows)]
+    fn slow_success_command() -> String {
+        "Start-Sleep -Milliseconds 200; Write-Output -NoNewline done".into()
+    }
+
+    #[cfg(windows)]
+    fn append_command(path: &Path, value: &str) -> String {
+        let path = path.display().to_string().replace('\'', "''");
+        format!("Add-Content -LiteralPath '{path}' -Value '{value}'")
+    }
+
     #[test]
     fn serve_lists_stable_session_tools() {
         let router = HandsServer::tool_router();
@@ -790,15 +826,16 @@ mod tests {
             command: "printf 'hello'".into(),
             cwd: None,
             timeout_ms: Some(5_000),
+            caller_timeout_ms: None,
         })).await.unwrap();
 
-        assert_eq!(output.0.operation_id, "tool-op-1");
+        assert_eq!(output.0.operation_id, "op-00000000000000000001");
         assert_eq!(output.0.state, OperationState::Succeeded);
         assert!(output.0.summary.contains("stdout=5B"), "{}", output.0.summary);
         let captured = server
             .operation_output(Parameters(OperationParams {
                 session_id: connected.0.session_id.clone(),
-                operation_id: "tool-op-1".into(),
+                operation_id: output.0.operation_id.clone(),
             }))
             .await
             .unwrap();
@@ -807,6 +844,241 @@ mod tests {
         assert!(!captured.0.truncated);
         server.session_disconnect(Parameters(SessionIdParams {
             session_id: connected.0.session_id,
+        })).await.unwrap();
+        share.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn operation_ids_are_monotonic_durable_and_caller_key_is_idempotent() {
+        let share_state = tempfile::tempdir().unwrap();
+        let engineer_state = tempfile::tempdir().unwrap();
+        let side_effect = share_state.path().join("monotonic.txt");
+        let share = ShareService::start(share_state.path(), Arc::new(QuietObserver)).await.unwrap();
+        let server = HandsServer::with_sessions_dir(engineer_state.path());
+        let connected = server.session_connect(Parameters(SessionConnectParams {
+            invite: share.invitation().to_owned(),
+        })).await.unwrap().0;
+
+        let first = server.remote_exec(Parameters(RemoteExecParams {
+            session_id: connected.session_id.clone(),
+            operation_id: Some("caller-key-a".into()),
+            command: append_command(&side_effect, "once"),
+            cwd: None,
+            timeout_ms: Some(5_000),
+            caller_timeout_ms: None,
+        })).await.unwrap().0;
+        let duplicate = server.remote_exec(Parameters(RemoteExecParams {
+            session_id: connected.session_id.clone(),
+            operation_id: Some("caller-key-a".into()),
+            command: append_command(&side_effect, "once"),
+            cwd: None,
+            timeout_ms: Some(5_000),
+            caller_timeout_ms: None,
+        })).await.unwrap().0;
+        assert_eq!(duplicate.operation_id, first.operation_id);
+        assert_eq!(std::fs::read_to_string(&side_effect).unwrap(), "once\n");
+        drop(server);
+
+        let restarted = HandsServer::with_sessions_dir(engineer_state.path());
+        let second = restarted.remote_exec(Parameters(RemoteExecParams {
+            session_id: connected.session_id.clone(),
+            operation_id: Some("caller-key-b".into()),
+            command: "printf second".into(),
+            cwd: None,
+            timeout_ms: Some(5_000),
+            caller_timeout_ms: None,
+        })).await.unwrap().0;
+        assert_eq!(first.operation_id, "op-00000000000000000001");
+        assert_eq!(second.operation_id, "op-00000000000000000002");
+
+        restarted.session_disconnect(Parameters(SessionIdParams {
+            session_id: connected.session_id,
+        })).await.unwrap();
+        share.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn operation_output_preserves_delimiter_collision_and_stderr() {
+        let share_state = tempfile::tempdir().unwrap();
+        let engineer_state = tempfile::tempdir().unwrap();
+        let share = ShareService::start(share_state.path(), Arc::new(QuietObserver)).await.unwrap();
+        let server = HandsServer::with_sessions_dir(engineer_state.path());
+        let connected = server.session_connect(Parameters(SessionConnectParams {
+            invite: share.invitation().to_owned(),
+        })).await.unwrap().0;
+        let executed = server.remote_exec(Parameters(RemoteExecParams {
+            session_id: connected.session_id.clone(),
+            operation_id: Some("delimiter-key".into()),
+            command: "printf 'left\\n[stderr]\\nright'; printf 'actual-error' >&2".into(),
+            cwd: None,
+            timeout_ms: Some(5_000),
+            caller_timeout_ms: None,
+        })).await.unwrap().0;
+        let output = server.operation_output(Parameters(OperationParams {
+            session_id: connected.session_id.clone(),
+            operation_id: executed.operation_id,
+        })).await.unwrap().0;
+        assert_eq!(output.stdout, "left\n[stderr]\nright");
+        assert_eq!(output.stderr, "actual-error");
+        server.session_disconnect(Parameters(SessionIdParams {
+            session_id: connected.session_id,
+        })).await.unwrap();
+        share.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn operation_output_reports_executor_truncation() {
+        let share_state = tempfile::tempdir().unwrap();
+        let engineer_state = tempfile::tempdir().unwrap();
+        let share = ShareService::start(share_state.path(), Arc::new(QuietObserver)).await.unwrap();
+        let server = HandsServer::with_sessions_dir(engineer_state.path());
+        let connected = server.session_connect(Parameters(SessionConnectParams {
+            invite: share.invitation().to_owned(),
+        })).await.unwrap().0;
+        let executed = server.remote_exec(Parameters(RemoteExecParams {
+            session_id: connected.session_id.clone(),
+            operation_id: Some("truncated-key".into()),
+            command: "head -c 1100000 /dev/zero | tr '\\0' x".into(),
+            cwd: None,
+            timeout_ms: Some(5_000),
+            caller_timeout_ms: None,
+        })).await.unwrap().0;
+        let output = server.operation_output(Parameters(OperationParams {
+            session_id: connected.session_id.clone(),
+            operation_id: executed.operation_id,
+        })).await.unwrap().0;
+        assert!(output.truncated);
+        assert!(output.stdout.len() <= crate::net::session_store::MAX_OPERATION_OUTPUT_BYTES);
+        server.session_disconnect(Parameters(SessionIdParams {
+            session_id: connected.session_id,
+        })).await.unwrap();
+        share.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_status_mirrors_running_and_terminal_operation() {
+        let share_state = tempfile::tempdir().unwrap();
+        let engineer_state = tempfile::tempdir().unwrap();
+        let share = ShareService::start(share_state.path(), Arc::new(QuietObserver)).await.unwrap();
+        let server = HandsServer::with_sessions_dir(engineer_state.path());
+        let connected = server.session_connect(Parameters(SessionConnectParams {
+            invite: share.invitation().to_owned(),
+        })).await.unwrap().0;
+        let executing = {
+            let server = server.clone();
+            let session_id = connected.session_id.clone();
+            tokio::spawn(async move {
+                server.remote_exec(Parameters(RemoteExecParams {
+                    session_id,
+                    operation_id: Some("status-key".into()),
+                    command: slow_success_command(),
+                    cwd: None,
+                    timeout_ms: Some(5_000),
+                    caller_timeout_ms: None,
+                })).await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let running = server.session_status(Parameters(SessionIdParams {
+            session_id: connected.session_id.clone(),
+        })).await.unwrap().0;
+        assert_eq!(running.last_operation.as_ref().map(|operation| operation.state.as_str()), Some("running"));
+        let completed = executing.await.unwrap().unwrap().0;
+        let terminal = server.session_status(Parameters(SessionIdParams {
+            session_id: connected.session_id.clone(),
+        })).await.unwrap().0;
+        assert_eq!(terminal.last_operation.as_ref().map(|operation| operation.operation_id.as_str()), Some(completed.operation_id.as_str()));
+        assert_eq!(terminal.last_operation.as_ref().map(|operation| operation.state.as_str()), Some("succeeded"));
+        server.session_disconnect(Parameters(SessionIdParams {
+            session_id: connected.session_id,
+        })).await.unwrap();
+        share.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn corrupted_cached_engineer_store_blocks_remote_spawn() {
+        let share_state = tempfile::tempdir().unwrap();
+        let engineer_state = tempfile::tempdir().unwrap();
+        let side_effect = share_state.path().join("must-not-exist.txt");
+        let share = ShareService::start(share_state.path(), Arc::new(QuietObserver)).await.unwrap();
+        let server = HandsServer::with_sessions_dir(engineer_state.path());
+        let connected = server.session_connect(Parameters(SessionConnectParams {
+            invite: share.invitation().to_owned(),
+        })).await.unwrap().0;
+        std::fs::write(
+            engineer_state.path().join(&connected.session_id).join("operations.jsonl"),
+            b"{corrupt-ledger}\n",
+        ).unwrap();
+
+        let result = server.remote_exec(Parameters(RemoteExecParams {
+            session_id: connected.session_id.clone(),
+            operation_id: Some("corrupt-key".into()),
+            command: append_command(&side_effect, "bad"),
+            cwd: None,
+            timeout_ms: Some(5_000),
+            caller_timeout_ms: None,
+        })).await;
+        let error = match result {
+            Ok(_) => panic!("corrupt local store must fail closed before remote spawn"),
+            Err(error) => error,
+        };
+        assert_eq!(error.data.as_ref().and_then(|data| data["code"].as_str()), Some("storage_unavailable"));
+        assert!(!side_effect.exists());
+        share.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn caller_timeout_returns_queryable_unknown_without_replay() {
+        let share_state = tempfile::tempdir().unwrap();
+        let engineer_state = tempfile::tempdir().unwrap();
+        let side_effect = share_state.path().join("unknown-once.txt");
+        let share = ShareService::start(share_state.path(), Arc::new(QuietObserver)).await.unwrap();
+        let server = HandsServer::with_sessions_dir(engineer_state.path());
+        let connected = server.session_connect(Parameters(SessionConnectParams {
+            invite: share.invitation().to_owned(),
+        })).await.unwrap().0;
+
+        let result = server.remote_exec(Parameters(RemoteExecParams {
+            session_id: connected.session_id.clone(),
+            operation_id: Some("unknown-key".into()),
+            command: delayed_append_command(&side_effect),
+            cwd: None,
+            timeout_ms: Some(5_000),
+            caller_timeout_ms: Some(20),
+        })).await;
+        let error = match result {
+            Ok(_) => panic!("short caller timeout must report unknown_in_progress"),
+            Err(error) => error,
+        };
+        assert_eq!(error.data.as_ref().and_then(|data| data["code"].as_str()), Some("unknown_in_progress"));
+        let operation_id = error.data.as_ref().and_then(|data| data["operation_id"].as_str()).unwrap().to_owned();
+
+        let terminal = loop {
+            let status = server.operation_status(Parameters(OperationParams {
+                session_id: connected.session_id.clone(),
+                operation_id: operation_id.clone(),
+            })).await.unwrap().0;
+            if status.state.is_terminal() {
+                break status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(terminal.state, OperationState::Succeeded);
+        let duplicate = server.remote_exec(Parameters(RemoteExecParams {
+            session_id: connected.session_id.clone(),
+            operation_id: Some("unknown-key".into()),
+            command: delayed_append_command(&side_effect),
+            cwd: None,
+            timeout_ms: Some(5_000),
+            caller_timeout_ms: Some(20),
+        })).await.unwrap().0;
+        assert_eq!(duplicate.operation_id, operation_id);
+        assert_eq!(std::fs::read_to_string(&side_effect).unwrap(), "once\n");
+
+        server.session_disconnect(Parameters(SessionIdParams {
+            session_id: connected.session_id,
         })).await.unwrap();
         share.shutdown().await.unwrap();
     }

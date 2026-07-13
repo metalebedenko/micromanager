@@ -171,12 +171,13 @@ mod core_remote_assist {
                 "command": "printf 'stdio-ok'",
                 "timeout_ms": 5000,
             })).await;
-            assert_eq!(executed["operation_id"], "stdio-op-1");
+            assert_eq!(executed["operation_id"], "op-00000000000000000001");
             assert_eq!(executed["state"], "succeeded");
+            let canonical_operation_id = executed["operation_id"].as_str().unwrap();
 
             let status = call(&client, "operation_status", serde_json::json!({
                 "session_id": session_id,
-                "operation_id": "stdio-op-1",
+                "operation_id": canonical_operation_id,
             })).await;
             assert_eq!(status["state"], "succeeded");
 

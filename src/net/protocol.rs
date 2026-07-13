@@ -96,10 +96,16 @@ impl OperationState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationRecord {
     pub id: String,
+    #[serde(default)]
+    pub request_key: Option<String>,
     pub command: String,
     pub state: OperationState,
     pub summary: Option<String>,
     pub output: Option<String>,
+    #[serde(default)]
+    pub stdout: String,
+    #[serde(default)]
+    pub stderr: String,
     pub output_truncated: bool,
     pub output_pruned: bool,
     pub created_at_unix: u64,
@@ -107,14 +113,25 @@ pub struct OperationRecord {
     pub finished_at_unix: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationCapture {
+    pub output: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub truncated: bool,
+}
+
 impl OperationRecord {
     pub fn queued(id: impl Into<String>, command: impl Into<String>, now_unix: u64) -> Self {
         Self {
             id: id.into(),
+            request_key: None,
             command: command.into(),
             state: OperationState::Queued,
             summary: None,
             output: None,
+            stdout: String::new(),
+            stderr: String::new(),
             output_truncated: false,
             output_pruned: false,
             created_at_unix: now_unix,
@@ -151,6 +168,20 @@ impl OperationRecord {
         self.transition(terminal, now_unix)?;
         self.summary = Some(summary.into());
         self.output = Some(output.into());
+        Ok(())
+    }
+
+    pub fn finish_detailed(
+        &mut self,
+        terminal: OperationState,
+        summary: impl Into<String>,
+        capture: OperationCapture,
+        now_unix: u64,
+    ) -> Result<(), ProtocolError> {
+        self.finish(terminal, summary, capture.output, now_unix)?;
+        self.stdout = capture.stdout;
+        self.stderr = capture.stderr;
+        self.output_truncated = capture.truncated;
         Ok(())
     }
 }
@@ -233,5 +264,20 @@ mod tests {
         let restored: OperationRecord = serde_json::from_slice(&json).unwrap();
 
         assert_eq!(restored, operation);
+    }
+
+    #[test]
+    fn legacy_operation_without_stream_fields_deserializes() {
+        let mut value = serde_json::to_value(queued()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("request_key");
+        object.remove("stdout");
+        object.remove("stderr");
+
+        let restored: OperationRecord = serde_json::from_value(value).unwrap();
+
+        assert_eq!(restored.request_key, None);
+        assert!(restored.stdout.is_empty());
+        assert!(restored.stderr.is_empty());
     }
 }

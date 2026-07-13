@@ -376,6 +376,8 @@ async fn cleanup(inner: Arc<ShareInner>) -> Result<(), ShareError> {
             shutdown_state,
             shutdown_summary,
             "",
+            "",
+            false,
         ) {
             errors.push(error.to_string());
         }
@@ -894,7 +896,9 @@ fn persist_exec_result(
         operation_id,
         state,
         &result.summary,
-        &result.output,
+        &result.stdout,
+        &result.stderr,
+        result.output_truncated,
     )
 }
 
@@ -914,6 +918,8 @@ fn persist_wait_error(
         state,
         &format!("[error] {message}"),
         "",
+        "",
+        false,
     )
 }
 
@@ -922,9 +928,18 @@ fn finish_if_running(
     operation_id: &str,
     state: OperationState,
     summary: &str,
-    output: &str,
+    stdout: &str,
+    stderr: &str,
+    output_truncated: bool,
 ) -> Result<OperationRecord, ShareError> {
-    Ok(store.finish_if_nonterminal(operation_id, state, summary, output)?)
+    Ok(store.finish_if_nonterminal_detailed(
+        operation_id,
+        state,
+        summary,
+        stdout,
+        stderr,
+        output_truncated,
+    )?)
 }
 
 fn random_token(length: usize) -> String {
