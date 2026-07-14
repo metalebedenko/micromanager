@@ -1384,7 +1384,7 @@ mod tests {
             reply.record.state,
             crate::net::protocol::OperationState::Succeeded
         );
-        assert_eq!(std::fs::read_to_string(output).unwrap(), "once\n");
+        assert_once_line(&output);
         assert_eq!(
             controller
                 .operation_status("controller-double-loss")
@@ -1569,7 +1569,7 @@ mod tests {
             restored.state,
             crate::net::protocol::OperationState::Succeeded
         );
-        assert_eq!(std::fs::read_to_string(&output).unwrap(), "once\n");
+        assert_once_line(&output);
         resumed.disconnect().await.unwrap();
         share.shutdown().await.unwrap();
     }
@@ -1610,7 +1610,7 @@ mod tests {
             restored.state,
             crate::net::protocol::OperationState::Succeeded
         );
-        assert_eq!(std::fs::read_to_string(&output).unwrap(), "once\n");
+        assert_once_line(&output);
         resumed.disconnect().await.unwrap();
         share.shutdown().await.unwrap();
     }
@@ -1678,7 +1678,7 @@ mod tests {
             restored.state,
             crate::net::protocol::OperationState::Succeeded
         );
-        assert_eq!(std::fs::read_to_string(&output).unwrap(), "once\n");
+        assert_once_line(&output);
         remote_task.await.unwrap().unwrap();
         resumed.disconnect().await.unwrap();
         share.shutdown().await.unwrap();
@@ -1766,7 +1766,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(std::fs::read_to_string(output).unwrap(), "once\n");
+        assert_once_line(&output);
         remote_task.await.unwrap().unwrap();
         resumed.disconnect().await.unwrap();
         share.shutdown().await.unwrap();
@@ -1883,6 +1883,11 @@ mod tests {
         })
         .await
         .expect("background recovery must reach a terminal state")
+    }
+
+    fn assert_once_line(path: &std::path::Path) {
+        let content = std::fs::read_to_string(path).unwrap();
+        assert_eq!(content.lines().collect::<Vec<_>>(), ["once"]);
     }
 
     #[cfg(unix)]
