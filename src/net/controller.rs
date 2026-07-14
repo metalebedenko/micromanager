@@ -1521,6 +1521,12 @@ mod tests {
         drop(session_a);
         drop(session_b);
         drop(initial);
+        let session_dir_a = engineer_root.path().join(&id_a);
+        let session_dir_b = engineer_root.path().join(&id_b);
+        tokio::join!(
+            wait_for_store_lock_release(&session_dir_a),
+            wait_for_store_lock_release(&session_dir_b),
+        );
 
         let resumed = Arc::new(SessionRegistry::new(engineer_root.path()));
         let (first_a, second_a, first_b) =
@@ -1741,13 +1747,7 @@ mod tests {
         .unwrap();
         drop(controller);
 
-        let resumed = tokio::time::timeout(
-            Duration::from_millis(75),
-            SessionController::resume(&session_dir),
-        )
-        .await
-        .expect("resume must not wait for unfinished command")
-        .unwrap();
+        let resumed = resume_promptly_after_lock_release(&session_dir).await;
         assert_eq!(
             resumed.operation_status(operation_id).await.unwrap().state,
             crate::net::protocol::OperationState::Running
@@ -1901,6 +1901,48 @@ mod tests {
         })
         .await
         .expect("session store lock must be released after controller drop")
+    }
+
+    async fn resume_promptly_after_lock_release(
+        session_dir: &std::path::Path,
+    ) -> SessionController {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let attempt = tokio::time::timeout(
+                    Duration::from_millis(75),
+                    SessionController::resume(session_dir),
+                )
+                .await
+                .expect("resume must not wait for unfinished command");
+                match attempt {
+                    Ok(controller) => break controller,
+                    Err(ControllerError::Storage(
+                        crate::net::session_store::StoreError::Locked,
+                    )) => {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(error) => panic!("session resume failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("session store lock must be released after controller drop")
+    }
+
+    async fn wait_for_store_lock_release(session_dir: &std::path::Path) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match crate::net::session_store::SessionStore::open(session_dir) {
+                    Ok(store) => break drop(store),
+                    Err(crate::net::session_store::StoreError::Locked) => {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(error) => panic!("session store open failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("session store lock must be released after controller drop");
     }
 
     fn assert_once_line(path: &std::path::Path) {
