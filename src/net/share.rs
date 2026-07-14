@@ -595,7 +595,11 @@ impl ShareClient {
         .await?;
         streams.0.finish().map_err(transport)?;
         match read_frame(&mut streams.1).await? {
-            WireReply::Disconnected => Ok(()),
+            WireReply::Disconnected => {
+                self.connection
+                    .close(0_u32.into(), b"micromanager client disconnected");
+                Ok(())
+            }
             WireReply::Error { message } => Err(ShareError::Remote(message)),
             WireReply::StorageUnavailable { message } => Err(ShareError::RemoteStorage(message)),
             WireReply::QueueFull => Err(ShareError::QueueFull),
@@ -607,6 +611,13 @@ impl ShareClient {
         let mut streams = self.streams.lock().await;
         write_frame(&mut streams.0, &request).await?;
         read_frame(&mut streams.1).await
+    }
+}
+
+impl Drop for ShareClient {
+    fn drop(&mut self) {
+        self.connection
+            .close(0_u32.into(), b"micromanager client dropped");
     }
 }
 
