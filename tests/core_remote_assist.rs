@@ -27,13 +27,39 @@ fn append_command(path: &std::path::Path) -> String {
     format!("Add-Content -LiteralPath '{path}' -Value 'once'")
 }
 
+#[cfg(unix)]
+fn stdout_command() -> &'static str {
+    "printf 'stdio-ok'"
+}
+
+#[cfg(windows)]
+fn stdout_command() -> &'static str {
+    "Write-Output -NoNewline 'stdio-ok'"
+}
+
+async fn resume_after_lock_release(session_dir: &std::path::Path) -> SessionController {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match SessionController::resume(session_dir).await {
+                Ok(controller) => break controller,
+                Err(micromanager::net::ControllerError::Storage(
+                    micromanager::net::session_store::StoreError::Locked,
+                )) => tokio::time::sleep(Duration::from_millis(10)).await,
+                Err(error) => panic!("session resume failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("session store lock must be released after controller drop")
+}
+
 mod core_remote_assist {
     use super::*;
 
     pub mod share {
         use super::*;
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread")]
         async fn public_invite_reconnect_and_exactly_once_operation() {
             let state = tempfile::tempdir().unwrap();
             let output = state.path().join("acceptance.txt");
@@ -72,7 +98,7 @@ mod core_remote_assist {
     pub mod controller {
         use super::*;
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread")]
         async fn public_controller_resumes_durable_session_and_operation_status() {
             let share_state = tempfile::tempdir().unwrap();
             let engineer_state = tempfile::tempdir().unwrap();
@@ -95,7 +121,7 @@ mod core_remote_assist {
             let completed = controller.execute(operation).await.unwrap();
             let session_dir = controller.session_dir().to_owned();
             drop(controller);
-            let resumed = SessionController::resume(&session_dir).await.unwrap();
+            let resumed = resume_after_lock_release(&session_dir).await;
             let restored = resumed
                 .operation_status("controller-acceptance-op-1")
                 .await
@@ -103,7 +129,13 @@ mod core_remote_assist {
 
             assert_eq!(restored, completed.record);
             assert_eq!(restored.state, OperationState::Succeeded);
-            assert_eq!(std::fs::read_to_string(output).unwrap(), "once\n");
+            assert_eq!(
+                std::fs::read_to_string(output)
+                    .unwrap()
+                    .lines()
+                    .collect::<Vec<_>>(),
+                ["once"]
+            );
             resumed.disconnect().await.unwrap();
             service.shutdown().await.unwrap();
         }
@@ -168,7 +200,7 @@ mod core_remote_assist {
             let executed = call(&client, "remote_exec", serde_json::json!({
                 "session_id": session_id,
                 "operation_id": "stdio-op-1",
-                "command": "printf 'stdio-ok'",
+                "command": stdout_command(),
                 "timeout_ms": 5000,
             })).await;
             assert_eq!(executed["operation_id"], "op-00000000000000000001");
