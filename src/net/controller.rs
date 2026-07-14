@@ -1080,6 +1080,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn same_controller_reconnects_and_second_controller_is_busy() {
         let share_state = tempfile::tempdir().unwrap();
@@ -1104,6 +1105,7 @@ mod tests {
         share.shutdown().await.unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn lease_takeover_uses_injected_clock_and_invalidates_old_token() {
         use std::sync::atomic::{AtomicU64, Ordering};
