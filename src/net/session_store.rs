@@ -20,13 +20,22 @@ pub const MAX_SESSION_OUTPUT_BYTES: usize = 50 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum StoreError {
-    Corrupt { path: PathBuf, message: String },
+    Corrupt {
+        path: PathBuf,
+        message: String,
+    },
     UnsupportedSchema(u64),
     Locked,
-    Unavailable { path: PathBuf, message: String },
+    Unavailable {
+        path: PathBuf,
+        message: String,
+    },
     AlreadyExists(PathBuf),
     Duplicate(Box<OperationRecord>),
-    IdempotencyConflict { request_key: String, operation_id: String },
+    IdempotencyConflict {
+        request_key: String,
+        operation_id: String,
+    },
     QueueFull,
     OperationNotFound(String),
     InvalidTransition(ProtocolError),
@@ -184,6 +193,16 @@ impl SessionStore {
     }
 
     pub fn begin_operation(&self, id: &str, command: &str) -> Result<OperationRecord, StoreError> {
+        self.begin_operation_request(id, command, None, 0)
+    }
+
+    pub fn begin_operation_request(
+        &self,
+        id: &str,
+        command: &str,
+        cwd: Option<&Path>,
+        remote_timeout_ms: u64,
+    ) -> Result<OperationRecord, StoreError> {
         let mut state = self.lock_state()?;
         ensure_writable(&state, &self.dir)?;
         if let Some(existing) = state.operations.get(id) {
@@ -197,7 +216,9 @@ impl SessionStore {
         if queued >= MAX_QUEUED_OPERATIONS {
             return Err(StoreError::QueueFull);
         }
-        let record = OperationRecord::queued(id, command, now_unix());
+        let mut record = OperationRecord::queued(id, command, now_unix());
+        record.cwd = cwd.map(Path::to_path_buf);
+        record.remote_timeout_ms = remote_timeout_ms;
         self.append_or_poison(&mut state, &record)?;
         state.operations.insert(id.to_owned(), record.clone());
         Ok(record)
@@ -264,7 +285,7 @@ impl SessionStore {
     }
 
     pub fn mark_running(&self, id: &str) -> Result<OperationRecord, StoreError> {
-        self.mark_running_with_dispatch(id, false)
+        self.mark_running_with_dispatch(id, true)
     }
 
     pub fn mark_dispatched_running(&self, id: &str) -> Result<OperationRecord, StoreError> {
@@ -415,11 +436,8 @@ impl SessionStore {
         if only_nonterminal && record.state.is_terminal() {
             return Ok(record);
         }
-        let (stdout, stderr, clipped) = clip_streams(
-            &capture.stdout,
-            &capture.stderr,
-            MAX_OPERATION_OUTPUT_BYTES,
-        );
+        let (stdout, stderr, clipped) =
+            clip_streams(&capture.stdout, &capture.stderr, MAX_OPERATION_OUTPUT_BYTES);
         let (combined, combined_clipped) = clip_utf8(
             &combine_output(&stdout, &stderr),
             MAX_OPERATION_OUTPUT_BYTES,
@@ -461,6 +479,22 @@ impl SessionStore {
             .cloned()
             .collect();
         records.sort_by_key(|record| (canonical_sequence(&record.id), record.id.clone()));
+        Ok(records)
+    }
+
+    pub fn recent_operations(&self, limit: usize) -> Result<Vec<OperationRecord>, StoreError> {
+        let mut records: Vec<_> = self.lock_state()?.operations.values().cloned().collect();
+        records.sort_by_key(|record| {
+            (
+                record.updated_at_unix,
+                record.created_at_unix,
+                canonical_sequence(&record.id),
+                record.id.clone(),
+            )
+        });
+        if records.len() > limit {
+            records.drain(..records.len() - limit);
+        }
         Ok(records)
     }
 
@@ -792,9 +826,8 @@ fn validate_ledger_record(
         && match previous {
             None => next.state == OperationState::Queued,
             Some(previous) if previous.state.is_terminal() && next.state == previous.state => {
-                previous.command == next.command
-                    && previous.request_key == next.request_key
-                    && previous.created_at_unix == next.created_at_unix
+                same_immutable_request(previous, next)
+                    && previous.dispatched == next.dispatched
                     && next.updated_at_unix >= previous.updated_at_unix
                     && previous.output.is_some()
                     && next.output.is_none()
@@ -806,9 +839,8 @@ fn validate_ledger_record(
                     .transition(next.state, next.updated_at_unix)
                     .is_ok()
                     && expected.state == next.state
-                    && previous.command == next.command
-                    && previous.request_key == next.request_key
-                    && previous.created_at_unix == next.created_at_unix
+                    && same_immutable_request(previous, next)
+                    && (!previous.dispatched || next.dispatched)
                     && next.updated_at_unix >= previous.updated_at_unix
             }
         };
@@ -838,6 +870,8 @@ fn valid_record_snapshot(record: &OperationRecord) -> bool {
                 && !record.output_truncated
                 && !record.output_pruned
                 && record.finished_at_unix.is_none()
+                && (record.state != OperationState::Queued || !record.dispatched)
+                && (record.state != OperationState::Running || record.dispatched)
         }
         state if state.is_terminal() => {
             record.summary.is_some()
@@ -847,6 +881,15 @@ fn valid_record_snapshot(record: &OperationRecord) -> bool {
         }
         _ => false,
     }
+}
+
+fn same_immutable_request(previous: &OperationRecord, next: &OperationRecord) -> bool {
+    previous.id == next.id
+        && previous.request_key == next.request_key
+        && previous.command == next.command
+        && previous.cwd == next.cwd
+        && previous.remote_timeout_ms == next.remote_timeout_ms
+        && previous.created_at_unix == next.created_at_unix
 }
 
 fn output_len(record: &OperationRecord) -> usize {
@@ -972,13 +1015,19 @@ mod tests {
 
         let queued = store.status().unwrap();
         assert_eq!(queued.queue_len, 1);
-        assert_eq!(queued.last_operation.as_ref().unwrap().id, allocated.record.id);
+        assert_eq!(
+            queued.last_operation.as_ref().unwrap().id,
+            allocated.record.id
+        );
         assert_eq!(queued.last_operation.unwrap().state, OperationState::Queued);
 
         store.mark_running(&allocated.record.id).unwrap();
         let running = store.status().unwrap();
         assert_eq!(running.queue_len, 0);
-        assert_eq!(running.last_operation.unwrap().state, OperationState::Running);
+        assert_eq!(
+            running.last_operation.unwrap().state,
+            OperationState::Running
+        );
     }
 
     #[test]
@@ -1013,7 +1062,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(first.record.created_at_unix, second.record.created_at_unix);
-        assert_eq!(store.status().unwrap().last_operation.unwrap().id, second.record.id);
+        assert_eq!(
+            store.status().unwrap().last_operation.unwrap().id,
+            second.record.id
+        );
     }
 
     #[test]
@@ -1245,6 +1297,65 @@ mod tests {
             SessionStore::open(&dir),
             Err(StoreError::Corrupt { .. })
         ));
+    }
+
+    #[test]
+    fn ledger_rejects_dispatched_lifecycle_and_immutable_request_corruption() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("session-1");
+        let store = SessionStore::create_engineer(&dir, engineer_meta("session-1")).unwrap();
+        let cwd = PathBuf::from("/tmp/original");
+        let allocated = store
+            .begin_allocated_operation(Some("immutable"), "echo ok", Some(&cwd), 1_234)
+            .unwrap();
+        store.mark_dispatched_running(&allocated.record.id).unwrap();
+        drop(store);
+        let ledger = dir.join("operations.jsonl");
+        let mut lines: Vec<serde_json::Value> = std::fs::read_to_string(&ledger)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        lines[1]["cwd"] = serde_json::Value::String("/tmp/tampered".into());
+        lines[1]["remote_timeout_ms"] = serde_json::Value::from(9_999_u64);
+        std::fs::write(
+            &ledger,
+            lines
+                .into_iter()
+                .map(|line| serde_json::to_string(&line).unwrap() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            SessionStore::open(&dir),
+            Err(StoreError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn ledger_requires_queued_undispatched_and_running_dispatched() {
+        let root = tempfile::tempdir().unwrap();
+        let queued_dir = root.path().join("queued");
+        let queued = SessionStore::create_engineer(&queued_dir, engineer_meta("queued")).unwrap();
+        queued.begin_operation("op-1", "echo queued").unwrap();
+        drop(queued);
+        let ledger = queued_dir.join("operations.jsonl");
+        let line = std::fs::read_to_string(&ledger).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        value["dispatched"] = serde_json::Value::Bool(true);
+        std::fs::write(&ledger, serde_json::to_string(&value).unwrap() + "\n").unwrap();
+        assert!(matches!(
+            SessionStore::open(&queued_dir),
+            Err(StoreError::Corrupt { .. })
+        ));
+
+        let running_dir = root.path().join("running");
+        let running =
+            SessionStore::create_engineer(&running_dir, engineer_meta("running")).unwrap();
+        running.begin_operation("op-1", "echo running").unwrap();
+        let record = running.mark_running("op-1").unwrap();
+        assert!(record.dispatched, "running records must be dispatched");
     }
 
     #[test]

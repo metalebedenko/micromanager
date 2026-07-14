@@ -68,6 +68,7 @@ pub struct SessionStatusOutput {
     pub queue_len: usize,
     pub lease: LeaseOutput,
     pub last_operation: Option<OperationSummaryOutput>,
+    pub remote: Option<RemoteSummaryOutput>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -76,11 +77,21 @@ pub struct LeaseOutput {
     pub expires_at_unix: u64,
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize, JsonSchema, Clone)]
 pub struct OperationSummaryOutput {
     pub operation_id: String,
     pub state: String,
     pub summary: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct RemoteSummaryOutput {
+    pub session_id: String,
+    pub started_at_unix: u64,
+    pub updated_at_unix: u64,
+    pub status: String,
+    pub queue_len: usize,
+    pub recent_operations: Vec<OperationSummaryOutput>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -518,7 +529,16 @@ impl HandsServer {
         Parameters(SessionIdParams { session_id }): Parameters<SessionIdParams>,
     ) -> Result<Json<SessionStatusOutput>, ErrorData> {
         self.relay_guard()?;
-        let status = self.sessions.get(&session_id).await.map_err(controller_error)?.status().map_err(controller_error)?;
+        let controller = self.sessions.get(&session_id).await.map_err(controller_error)?;
+        let status = controller.status().map_err(controller_error)?;
+        let remote = remote_summary_best_effort(&controller)
+            .await
+            .map(remote_summary_output);
+        let last_operation = status
+            .last_operation
+            .as_ref()
+            .map(operation_summary)
+            .or_else(|| remote.as_ref().and_then(|summary| summary.recent_operations.last().cloned()));
         Ok(Json(SessionStatusOutput {
             connection: status.connection.into(),
             queue_len: status.queue_len,
@@ -526,7 +546,8 @@ impl HandsServer {
                 controller_id: status.lease.controller_id,
                 expires_at_unix: status.lease.expires_at_unix,
             },
-            last_operation: status.last_operation.as_ref().map(operation_summary),
+            last_operation,
+            remote,
         }))
     }
 
@@ -537,12 +558,14 @@ impl HandsServer {
     ) -> Result<Json<JournalOutput>, ErrorData> {
         self.relay_guard()?;
         let controller = self.sessions.get(&session_id).await.map_err(controller_error)?;
+        let remote = remote_summary_best_effort(&controller).await;
         let path = controller.session_dir().join("journal.md");
         let markdown = match tokio::fs::read_to_string(&path).await {
             Ok(markdown) => markdown,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(error) => return Err(storage_error(error.to_string())),
         };
+        let markdown = render_session_journal(&markdown, remote.as_ref());
         Ok(Json(JournalOutput { session_id, markdown }))
     }
 
@@ -665,6 +688,74 @@ fn operation_summary(record: &OperationRecord) -> OperationSummaryOutput {
         state: operation_state(record.state),
         summary: record.summary.clone(),
     }
+}
+
+fn remote_summary_output(summary: crate::net::protocol::RemoteSessionSummary) -> RemoteSummaryOutput {
+    RemoteSummaryOutput {
+        session_id: summary.session_id,
+        started_at_unix: summary.started_at_unix,
+        updated_at_unix: summary.updated_at_unix,
+        status: summary.status,
+        queue_len: summary.queue_len,
+        recent_operations: summary.recent_operations.into_iter().map(|operation| {
+            OperationSummaryOutput {
+                operation_id: operation.operation_id,
+                state: operation_state(operation.state),
+                summary: operation.summary.map(|summary| crate::tg::redact(&summary)),
+            }
+        }).collect(),
+    }
+}
+
+async fn remote_summary_best_effort(
+    controller: &crate::net::SessionController,
+) -> Option<crate::net::protocol::RemoteSessionSummary> {
+    tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        controller.remote_summary(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+}
+
+fn render_session_journal(
+    local_markdown: &str,
+    remote: Option<&crate::net::protocol::RemoteSessionSummary>,
+) -> String {
+    let Some(remote) = remote else {
+        let mut markdown = "# Remote session summary\n\n_Remote summary unavailable._\n".to_owned();
+        if !local_markdown.trim().is_empty() {
+            markdown.push_str("\n# Engineer notes\n\n");
+            markdown.push_str(local_markdown);
+            if !local_markdown.ends_with('\n') { markdown.push('\n'); }
+        }
+        return markdown;
+    };
+    let mut markdown = format!(
+        "# Remote session summary\n\n- Session: `{}`\n- Status: {}\n- Started: {}\n- Updated: {}\n- Queued: {}\n\n## Recent operations\n\n",
+        remote.session_id, remote.status, remote.started_at_unix, remote.updated_at_unix,
+        remote.queue_len,
+    );
+    if remote.recent_operations.is_empty() {
+        markdown.push_str("_No operations recorded._\n");
+    } else {
+        for operation in &remote.recent_operations {
+            let summary = operation.summary.as_deref().map(crate::tg::redact).unwrap_or_default();
+            markdown.push_str(&format!(
+                "- `{}` — {}{}\n",
+                operation.operation_id,
+                operation_state(operation.state),
+                if summary.is_empty() { String::new() } else { format!(" — {summary}") },
+            ));
+        }
+    }
+    if !local_markdown.trim().is_empty() {
+        markdown.push_str("\n# Engineer notes\n\n");
+        markdown.push_str(local_markdown);
+        if !local_markdown.ends_with('\n') { markdown.push('\n'); }
+    }
+    markdown
 }
 
 fn operation_streams(record: &OperationRecord) -> (String, String) {
@@ -835,6 +926,26 @@ mod tests {
         assert_eq!(operation_streams(&record), ("legacy output".into(), String::new()));
     }
 
+    #[test]
+    fn remote_summary_output_redacts_operation_summaries() {
+        let output = remote_summary_output(crate::net::protocol::RemoteSessionSummary {
+            session_id: "session".into(),
+            started_at_unix: 1,
+            updated_at_unix: 2,
+            status: "active".into(),
+            queue_len: 0,
+            recent_operations: vec![crate::net::protocol::CompactOperation {
+                operation_id: "op-1".into(),
+                state: OperationState::Failed,
+                summary: Some("TOKEN=super-secret-value".into()),
+                updated_at_unix: 2,
+            }],
+        });
+        let summary = output.recent_operations[0].summary.as_deref().unwrap();
+        assert!(summary.contains("TOKEN=***"), "{summary}");
+        assert!(!summary.contains("super-secret-value"));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn session_status_reports_transport_drop_as_reconnecting() {
         let share_state = tempfile::tempdir().unwrap();
@@ -852,13 +963,16 @@ mod tests {
             .0;
         share.shutdown().await.unwrap();
 
-        let status = server
-            .session_status(Parameters(SessionIdParams {
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            server.session_status(Parameters(SessionIdParams {
                 session_id: connected.session_id,
-            }))
-            .await
-            .unwrap()
-            .0;
+            })),
+        )
+        .await
+        .expect("offline status must not wait for remote summary")
+        .unwrap()
+        .0;
         assert_eq!(status.connection, "reconnecting");
     }
 
@@ -1224,6 +1338,51 @@ mod tests {
         assert!(!journal.0.markdown.contains("super-secret-value"));
         restarted.session_disconnect(Parameters(SessionIdParams {
             session_id: connected.session_id,
+        })).await.unwrap();
+        share.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clean_engineer_receives_compact_remote_handoff_summary() {
+        let share_state = tempfile::tempdir().unwrap();
+        let first_engineer_state = tempfile::tempdir().unwrap();
+        let second_engineer_state = tempfile::tempdir().unwrap();
+        let share = ShareService::start(share_state.path(), Arc::new(QuietObserver)).await.unwrap();
+        let first = HandsServer::with_sessions_dir(first_engineer_state.path());
+        let connected = first.session_connect(Parameters(SessionConnectParams {
+            invite: share.invitation().to_owned(),
+        })).await.unwrap().0;
+        let executed = first.remote_exec(Parameters(RemoteExecParams {
+            session_id: connected.session_id.clone(),
+            operation_id: Some("handoff-operation".into()),
+            command: "echo handoff-ready".into(),
+            cwd: None,
+            timeout_ms: Some(5_000),
+            caller_timeout_ms: Some(5_000),
+        })).await.unwrap().0;
+        first.session_disconnect(Parameters(SessionIdParams {
+            session_id: connected.session_id,
+        })).await.unwrap();
+        drop(first);
+
+        let second = HandsServer::with_sessions_dir(second_engineer_state.path());
+        let reconnected = second.session_connect(Parameters(SessionConnectParams {
+            invite: share.invitation().to_owned(),
+        })).await.unwrap().0;
+        let status = second.session_status(Parameters(SessionIdParams {
+            session_id: reconnected.session_id.clone(),
+        })).await.unwrap().0;
+        let last = status.last_operation.expect("remote handoff includes latest operation");
+        assert_eq!(last.operation_id, executed.operation_id);
+        assert_eq!(last.state, "succeeded");
+
+        let journal = second.session_journal(Parameters(SessionIdParams {
+            session_id: reconnected.session_id.clone(),
+        })).await.unwrap().0;
+        assert!(journal.markdown.contains("Remote session summary"));
+        assert!(journal.markdown.contains(&executed.operation_id));
+        second.session_disconnect(Parameters(SessionIdParams {
+            session_id: reconnected.session_id,
         })).await.unwrap();
         share.shutdown().await.unwrap();
     }

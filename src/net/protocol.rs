@@ -120,6 +120,24 @@ pub struct OperationRecord {
     pub finished_at_unix: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactOperation {
+    pub operation_id: String,
+    pub state: OperationState,
+    pub summary: Option<String>,
+    pub updated_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteSessionSummary {
+    pub session_id: String,
+    pub started_at_unix: u64,
+    pub updated_at_unix: u64,
+    pub status: String,
+    pub queue_len: usize,
+    pub recent_operations: Vec<CompactOperation>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationCapture {
     pub output: String,

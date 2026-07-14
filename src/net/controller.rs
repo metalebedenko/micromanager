@@ -180,16 +180,23 @@ impl LeaseOwner {
 
 #[derive(Debug)]
 pub enum ControllerError {
-    Busy { expires_at_unix: u64 },
+    Busy {
+        expires_at_unix: u64,
+    },
     Reconnecting,
-    UnknownInProgress { operation_id: String },
+    UnknownInProgress {
+        operation_id: String,
+    },
     Storage(StoreError),
     RemoteStorage(String),
     QueueFull,
     Remote(String),
     Transport(String),
     InvalidState(String),
-    IdempotencyConflict { request_key: String, operation_id: String },
+    IdempotencyConflict {
+        request_key: String,
+        operation_id: String,
+    },
 }
 
 impl std::fmt::Display for ControllerError {
@@ -211,7 +218,10 @@ impl std::fmt::Display for ControllerError {
             Self::Remote(message) => write!(formatter, "remote session error: {message}"),
             Self::Transport(message) => write!(formatter, "controller transport error: {message}"),
             Self::InvalidState(message) => write!(formatter, "invalid controller state: {message}"),
-            Self::IdempotencyConflict { request_key, operation_id } => write!(
+            Self::IdempotencyConflict {
+                request_key,
+                operation_id,
+            } => write!(
                 formatter,
                 "idempotency key {request_key} conflicts with operation {operation_id}"
             ),
@@ -225,9 +235,13 @@ impl From<StoreError> for ControllerError {
     fn from(value: StoreError) -> Self {
         match value {
             StoreError::QueueFull => Self::QueueFull,
-            StoreError::IdempotencyConflict { request_key, operation_id } => {
-                Self::IdempotencyConflict { request_key, operation_id }
-            }
+            StoreError::IdempotencyConflict {
+                request_key,
+                operation_id,
+            } => Self::IdempotencyConflict {
+                request_key,
+                operation_id,
+            },
             error => Self::Storage(error),
         }
     }
@@ -451,7 +465,10 @@ impl SessionController {
             dispatcher: tokio::sync::Mutex::new(()),
             connection: AtomicU8::new(ConnectionState::Connected as u8),
         });
-        controller.recover_unfinished().await?;
+        let recovery = controller.clone();
+        tokio::spawn(async move {
+            let _ = recovery.recover_unfinished().await;
+        });
         Ok(controller)
     }
 
@@ -550,10 +567,7 @@ impl SessionController {
         caller_timeout: Duration,
     ) -> Result<OperationReply, ControllerError> {
         self.inner.store.verify_durable()?;
-        let allocated = self
-            .inner
-            .store
-            .begin_allocated_operation(
+        let allocated = self.inner.store.begin_allocated_operation(
                 request_key,
                 &command,
                 cwd.as_deref(),
@@ -613,9 +627,12 @@ impl SessionController {
                     .mark_dispatched_running(&request.operation_id)?;
             }
             Err(StoreError::OperationNotFound(_)) => {
-                self.inner
-                    .store
-                    .begin_operation(&request.operation_id, &request.command)?;
+                self.inner.store.begin_operation_request(
+                    &request.operation_id,
+                    &request.command,
+                    request.cwd.as_deref(),
+                    u64::try_from(request.timeout.as_millis()).unwrap_or(u64::MAX),
+                )?;
                 self.inner
                     .store
                     .mark_dispatched_running(&request.operation_id)?;
@@ -641,25 +658,33 @@ impl SessionController {
         let reply = match first {
             Ok(reply) => reply,
             Err(error) if is_reconnectable(&error) => {
+                loop {
                 match self.reconnect_and_reconcile(&request.operation_id).await? {
-                    Some(record) => OperationReply { record },
+                        Some(record) => break OperationReply { record },
                     None => {
                         // A healthy B has definitively reported not-found. Re-send the
                         // immutable request under the same canonical id; B's ledger
                         // deduplicates a late first packet.
-                        request.session_id = self.inner.client.lock().await.session_id().to_owned();
-                        match self.inner.client.lock().await.execute(request).await {
-                            Ok(reply) => reply,
+                            request.session_id =
+                                self.inner.client.lock().await.session_id().to_owned();
+                            match self
+                                .inner
+                                .client
+                                .lock()
+                                .await
+                                .execute(request.clone())
+                                .await
+                            {
+                                Ok(reply) => break reply,
+                                Err(error) if is_reconnectable(&error) => continue,
                             Err(error) => {
-                                self.finish_definitive_rejection(
-                                    &reply_operation_id,
-                                    &error,
-                                )?;
+                                    self.finish_definitive_rejection(&reply_operation_id, &error)?;
                                 return Err(error.into());
                             }
                         }
                     }
                 }
+            }
             }
             Err(error) => {
                 self.finish_definitive_rejection(&request.operation_id, &error)?;
@@ -667,7 +692,9 @@ impl SessionController {
             }
         };
         if reply.record.state.is_terminal() {
-            return self.mirror_terminal(&reply.record).map(|record| OperationReply { record });
+            return self
+                .mirror_terminal(&reply.record)
+                .map(|record| OperationReply { record });
         }
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -732,9 +759,7 @@ impl SessionController {
             };
             // A definitive rejection is now durable and must not prevent the
             // controller from recovering other operations.
-            if recovery.is_err()
-                && !self.inner.store.operation(&record.id)?.state.is_terminal()
-            {
+            if recovery.is_err() && !self.inner.store.operation(&record.id)?.state.is_terminal() {
                 recovery?;
             }
         }
@@ -799,6 +824,21 @@ impl SessionController {
     ) -> Result<crate::net::protocol::OperationRecord, ControllerError> {
         self.inner.store.verify_durable()?;
         Ok(self.inner.store.operation(operation_id)?)
+    }
+
+    pub async fn remote_summary(
+        &self,
+    ) -> Result<crate::net::protocol::RemoteSessionSummary, ControllerError> {
+        if let Ok(client) = self.inner.client.try_lock() {
+            return Ok(client.session_summary().await?);
+        }
+        let client = ShareClient::connect_with_credentials(
+            &self.inner.invite,
+            &self.inner.controller_id,
+            &self.inner.resume_token,
+        )
+        .await?;
+        Ok(client.session_summary().await?)
     }
 
     fn mirror_terminal(
@@ -1316,6 +1356,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consecutive_transport_losses_reconcile_same_id_to_terminal_once() {
+        let share_state = tempfile::tempdir().unwrap();
+        let engineer_state = tempfile::tempdir().unwrap();
+        let output = share_state.path().join("controller-double-loss.txt");
+        let share = ShareService::start(share_state.path(), Arc::new(StdoutTerminalObserver))
+            .await
+            .unwrap();
+        let controller = SessionController::connect(engineer_state.path(), share.invitation())
+            .await
+            .unwrap();
+        share.test_drop_next_execute_before_dispatch();
+        share.test_drop_next_operation_reply();
+
+        let reply = controller
+            .execute(crate::net::share::OperationRequest {
+                session_id: String::new(),
+                operation_id: "controller-double-loss".into(),
+                command: append_once_command(&output),
+                cwd: None,
+                timeout: Duration::from_secs(5),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reply.record.state,
+            crate::net::protocol::OperationState::Succeeded
+        );
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "once\n");
+        assert_eq!(
+            controller
+                .operation_status("controller-double-loss")
+                .await
+                .unwrap()
+                .state,
+            crate::net::protocol::OperationState::Succeeded
+        );
+        controller.disconnect().await.unwrap();
+        share.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn definitive_remote_rejection_is_durable_terminal_and_not_replayed() {
         let share_state = tempfile::tempdir().unwrap();
         let engineer_state = tempfile::tempdir().unwrap();
@@ -1425,16 +1507,10 @@ mod tests {
         let share_root_a = tempfile::tempdir().unwrap();
         let share_root_b = tempfile::tempdir().unwrap();
         let engineer_root = tempfile::tempdir().unwrap();
-        let share_a = ShareService::start(
-            share_root_a.path(),
-            Arc::new(StdoutTerminalObserver),
-        )
+        let share_a = ShareService::start(share_root_a.path(), Arc::new(StdoutTerminalObserver))
         .await
         .unwrap();
-        let share_b = ShareService::start(
-            share_root_b.path(),
-            Arc::new(StdoutTerminalObserver),
-        )
+        let share_b = ShareService::start(share_root_b.path(), Arc::new(StdoutTerminalObserver))
         .await
         .unwrap();
         let initial = SessionRegistry::new(engineer_root.path());
@@ -1447,11 +1523,8 @@ mod tests {
         drop(initial);
 
         let resumed = Arc::new(SessionRegistry::new(engineer_root.path()));
-        let (first_a, second_a, first_b) = tokio::join!(
-            resumed.get(&id_a),
-            resumed.get(&id_a),
-            resumed.get(&id_b),
-        );
+        let (first_a, second_a, first_b) =
+            tokio::join!(resumed.get(&id_a), resumed.get(&id_a), resumed.get(&id_b),);
         let first_a = first_a.unwrap();
         let second_a = second_a.unwrap();
         let first_b = first_b.unwrap();
@@ -1491,8 +1564,11 @@ mod tests {
         drop(controller);
 
         let resumed = SessionController::resume(&session_dir).await.unwrap();
-        let restored = resumed.operation_status(&allocated.record.id).await.unwrap();
-        assert_eq!(restored.state, crate::net::protocol::OperationState::Succeeded);
+        let restored = wait_for_terminal(&resumed, &allocated.record.id).await;
+        assert_eq!(
+            restored.state,
+            crate::net::protocol::OperationState::Succeeded
+        );
         assert_eq!(std::fs::read_to_string(&output).unwrap(), "once\n");
         resumed.disconnect().await.unwrap();
         share.shutdown().await.unwrap();
@@ -1528,9 +1604,12 @@ mod tests {
         drop(controller);
 
         let resumed = SessionController::resume(&session_dir).await.unwrap();
-        let restored = resumed.operation_status(&allocated.record.id).await.unwrap();
+        let restored = wait_for_terminal(&resumed, &allocated.record.id).await;
         assert_eq!(restored.id, allocated.record.id);
-        assert_eq!(restored.state, crate::net::protocol::OperationState::Succeeded);
+        assert_eq!(
+            restored.state,
+            crate::net::protocol::OperationState::Succeeded
+        );
         assert_eq!(std::fs::read_to_string(&output).unwrap(), "once\n");
         resumed.disconnect().await.unwrap();
         share.shutdown().await.unwrap();
@@ -1594,11 +1673,131 @@ mod tests {
         drop(controller);
 
         let resumed = SessionController::resume(&session_dir).await.unwrap();
-        let restored = resumed.operation_status(operation_id).await.unwrap();
-        assert_eq!(restored.state, crate::net::protocol::OperationState::Succeeded);
+        let restored = wait_for_terminal(&resumed, operation_id).await;
+        assert_eq!(
+            restored.state,
+            crate::net::protocol::OperationState::Succeeded
+        );
         assert_eq!(std::fs::read_to_string(&output).unwrap(), "once\n");
         remote_task.await.unwrap().unwrap();
         resumed.disconnect().await.unwrap();
+        share.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_returns_promptly_while_owned_supervisor_recovers_running_operation() {
+        let share_state = tempfile::tempdir().unwrap();
+        let engineer_state = tempfile::tempdir().unwrap();
+        let output = share_state.path().join("background-recovery.txt");
+        let share = ShareService::start(share_state.path(), Arc::new(StdoutTerminalObserver))
+            .await
+            .unwrap();
+        let controller = SessionController::connect(engineer_state.path(), share.invitation())
+            .await
+            .unwrap();
+        let session_dir = controller.session_dir().to_owned();
+        let operation_id = "op-00000000000000000001";
+        let command = delayed_append_command(&output, "once");
+        controller
+            .inner
+            .store
+            .begin_allocated_operation(Some("background"), &command, None, 5_000)
+            .unwrap();
+        controller
+            .inner
+            .store
+            .mark_dispatched_running(operation_id)
+            .unwrap();
+        let remote = ShareClient::connect_with_credentials(
+            share.invitation(),
+            controller.controller_id(),
+            controller.test_resume_token(),
+        )
+        .await
+        .unwrap();
+        let session_id = remote.session_id().to_owned();
+        let remote_task = tokio::spawn(async move {
+            remote
+                .execute(crate::net::share::OperationRequest {
+                    session_id,
+                    operation_id: operation_id.into(),
+                    command,
+                    cwd: None,
+                    timeout: Duration::from_secs(5),
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if share.operation_status(operation_id).is_ok_and(|record| {
+                    record.state == crate::net::protocol::OperationState::Running
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(controller);
+
+        let resumed = tokio::time::timeout(
+            Duration::from_millis(75),
+            SessionController::resume(&session_dir),
+        )
+        .await
+        .expect("resume must not wait for unfinished command")
+        .unwrap();
+        assert_eq!(
+            resumed.operation_status(operation_id).await.unwrap().state,
+            crate::net::protocol::OperationState::Running
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if resumed
+                    .operation_status(operation_id)
+                    .await
+                    .is_ok_and(|record| record.state.is_terminal())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "once\n");
+        remote_task.await.unwrap().unwrap();
+        resumed.disconnect().await.unwrap();
+        share.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_execute_persists_full_request_for_recovery() {
+        let share_state = tempfile::tempdir().unwrap();
+        let engineer_state = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let share = ShareService::start(share_state.path(), Arc::new(StdoutTerminalObserver))
+            .await
+            .unwrap();
+        let controller = SessionController::connect(engineer_state.path(), share.invitation())
+            .await
+            .unwrap();
+
+        let reply = controller
+            .execute(crate::net::share::OperationRequest {
+                session_id: String::new(),
+                operation_id: "public-full-request".into(),
+                command: "printf ok".into(),
+                cwd: Some(cwd.path().to_owned()),
+                timeout: Duration::from_millis(1_234),
+            })
+            .await
+            .unwrap();
+        assert_eq!(reply.record.cwd.as_deref(), Some(cwd.path()));
+        assert_eq!(reply.record.remote_timeout_ms, 1_234);
+        assert!(reply.record.dispatched);
+        controller.disconnect().await.unwrap();
         share.shutdown().await.unwrap();
     }
 
@@ -1642,20 +1841,48 @@ mod tests {
             .await
             .unwrap()
             .record;
-        assert_eq!(remote_record.state, crate::net::protocol::OperationState::Succeeded);
         assert_eq!(
-            controller.operation_status(operation_id).await.unwrap().state,
+            remote_record.state,
+            crate::net::protocol::OperationState::Succeeded
+        );
+        assert_eq!(
+            controller
+                .operation_status(operation_id)
+                .await
+                .unwrap()
+                .state,
             crate::net::protocol::OperationState::Running
         );
         drop(remote);
         drop(controller);
 
         let resumed = SessionController::resume(&session_dir).await.unwrap();
-        let restored = resumed.operation_status(operation_id).await.unwrap();
-        assert_eq!(restored.state, crate::net::protocol::OperationState::Succeeded);
+        let restored = wait_for_terminal(&resumed, operation_id).await;
+        assert_eq!(
+            restored.state,
+            crate::net::protocol::OperationState::Succeeded
+        );
         assert_eq!(restored.stdout, "terminal");
         resumed.disconnect().await.unwrap();
         share.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_terminal(
+        controller: &SessionController,
+        operation_id: &str,
+    ) -> crate::net::protocol::OperationRecord {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let record = controller.operation_status(operation_id).await.unwrap();
+                if record.state.is_terminal() {
+                    break record;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background recovery must reach a terminal state")
     }
 
     #[cfg(unix)]
