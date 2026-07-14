@@ -105,6 +105,26 @@ pub struct ShareClient {
     connection: Connection,
 }
 
+struct ConnectionCloseGuard(Option<Connection>);
+
+impl ConnectionCloseGuard {
+    fn new(connection: &Connection) -> Self {
+        Self(Some(connection.clone()))
+    }
+
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ConnectionCloseGuard {
+    fn drop(&mut self) {
+        if let Some(connection) = self.0.take() {
+            connection.close(0_u32.into(), b"micromanager handshake ended");
+        }
+    }
+}
+
 struct ShareInner {
     session_id: String,
     invitation: String,
@@ -471,6 +491,7 @@ impl ShareClient {
             .connect(invite.addr, SHARE_ALPN)
             .await
             .map_err(transport)?;
+        let close_guard = ConnectionCloseGuard::new(&connection);
         let (mut send, mut recv) = connection.open_bi().await.map_err(transport)?;
         match client_handshake(&mut send, &mut recv, &invite.secret)
             .await
@@ -506,14 +527,16 @@ impl ShareClient {
             WireReply::QueueFull => return Err(ShareError::QueueFull),
             _ => return Err(ShareError::Transport("unexpected lease reply".into())),
         };
-        Ok(Self {
+        let client = Self {
             session_id,
             resume_token: resume_token.to_owned(),
             lease_grant,
             streams: tokio::sync::Mutex::new((send, recv)),
             _endpoint: endpoint,
             connection,
-        })
+        };
+        close_guard.disarm();
+        Ok(client)
     }
 
     pub fn session_id(&self) -> &str {
