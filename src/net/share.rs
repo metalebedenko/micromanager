@@ -1307,11 +1307,20 @@ mod tests {
             first.state,
             OperationState::Running | OperationState::Succeeded
         ));
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let final_record = reconnected
-            .operation_status("op-running-drop")
-            .await
-            .unwrap();
+        let final_record = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let record = reconnected
+                    .operation_status("op-running-drop")
+                    .await
+                    .unwrap();
+                if record.state.is_terminal() {
+                    break record;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("remote command must reach a terminal state");
         assert_eq!(final_record.state, OperationState::Succeeded);
         share.shutdown().await.unwrap();
     }

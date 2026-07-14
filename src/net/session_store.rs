@@ -742,7 +742,9 @@ fn acquire_lock(dir: &Path) -> Result<File, StoreError> {
     let file = open_private_file(&path, false)?;
     match FileExt::try_lock_exclusive(&file) {
         Ok(()) => Ok(file),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Err(StoreError::Locked),
+        Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
+            Err(StoreError::Locked)
+        }
         Err(error) => Err(unavailable(&path, error)),
     }
 }

@@ -492,11 +492,19 @@ fn is_secretish(key: &str) -> bool {
 }
 
 fn looks_secret_blob(token: &str) -> bool {
-    !Path::new(token).is_absolute()
+    !looks_absolute_path(token)
         && token.len() >= 24
         && token.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '=' | '_')
         })
+}
+
+fn looks_absolute_path(token: &str) -> bool {
+    Path::new(token).is_absolute()
+        || token.starts_with('/')
+        || token.starts_with("\\\\")
+        || matches!(token.as_bytes(), [drive, b':', separator, ..]
+            if drive.is_ascii_alphabetic() && matches!(separator, b'/' | b'\\'))
 }
 
 fn clip_with_ellipsis(text: &str, max_bytes: usize) -> SanitizedOutput {
@@ -722,12 +730,15 @@ mod tests {
 
     #[test]
     fn redaction_keeps_long_absolute_paths_visible() {
-        let path = "/Users/sergeylebedenko/Documents/project";
+        for path in [
+            "/Users/sergeylebedenko/Documents/project",
+            r"C:\Users\sergeylebedenko\Documents\project",
+        ] {
+            let sanitized = sanitize_and_clip(path.as_bytes(), 200);
 
-        let sanitized = sanitize_and_clip(path.as_bytes(), 200);
-
-        assert_eq!(sanitized.text, path);
-        assert!(!sanitized.truncated);
+            assert_eq!(sanitized.text, path);
+            assert!(!sanitized.truncated);
+        }
     }
 
     #[test]

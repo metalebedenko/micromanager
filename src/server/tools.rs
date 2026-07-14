@@ -898,6 +898,11 @@ mod tests {
         format!("Add-Content -LiteralPath '{path}' -Value '{value}'")
     }
 
+    fn assert_once_line(path: &Path) {
+        let content = std::fs::read_to_string(path).unwrap();
+        assert_eq!(content.lines().collect::<Vec<_>>(), ["once"]);
+    }
+
     #[test]
     fn serve_lists_stable_session_tools() {
         let router = HandsServer::tool_router();
@@ -1096,7 +1101,7 @@ mod tests {
             caller_timeout_ms: None,
         })).await.unwrap().0;
         assert_eq!(duplicate.operation_id, first.operation_id);
-        assert_eq!(std::fs::read_to_string(&side_effect).unwrap(), "once\n");
+        assert_once_line(&side_effect);
         drop(server);
 
         let restarted = HandsServer::with_sessions_dir(engineer_state.path());
@@ -1295,7 +1300,7 @@ mod tests {
             caller_timeout_ms: Some(20),
         })).await.unwrap().0;
         assert_eq!(duplicate.operation_id, operation_id);
-        assert_eq!(std::fs::read_to_string(&side_effect).unwrap(), "once\n");
+        assert_once_line(&side_effect);
 
         server.session_disconnect(Parameters(SessionIdParams {
             session_id: connected.session_id,
