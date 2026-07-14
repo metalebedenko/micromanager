@@ -1539,6 +1539,7 @@ mod tests {
         share_b.shutdown().await.unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn resume_dispatches_durable_queued_request_once() {
         let share_state = tempfile::tempdir().unwrap();
@@ -1574,6 +1575,7 @@ mod tests {
         share.shutdown().await.unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn resume_resends_same_canonical_id_after_confirmed_remote_not_found() {
         let share_state = tempfile::tempdir().unwrap();
@@ -1615,6 +1617,7 @@ mod tests {
         share.shutdown().await.unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn resume_polls_remote_running_to_terminal_without_replay() {
         let share_state = tempfile::tempdir().unwrap();
@@ -1684,6 +1687,7 @@ mod tests {
         share.shutdown().await.unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn resume_returns_promptly_while_owned_supervisor_recovers_running_operation() {
         let share_state = tempfile::tempdir().unwrap();
@@ -1801,6 +1805,7 @@ mod tests {
         share.shutdown().await.unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn resume_mirrors_remote_terminal_committed_before_local_crash() {
         let share_state = tempfile::tempdir().unwrap();

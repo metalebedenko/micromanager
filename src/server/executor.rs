@@ -646,8 +646,11 @@ mod tests {
 
     use super::{
         sanitize_and_clip, validate_cwd, ExecRequest, ExecResult, Executor, TerminalObserver,
-        WaitOutcome, MAX_EXEC_TIMEOUT, MAX_OUTPUT_BYTES,
+        WaitOutcome, MAX_EXEC_TIMEOUT,
     };
+
+    #[cfg(unix)]
+    use super::MAX_OUTPUT_BYTES;
 
     #[derive(Default)]
     struct RecordingObserver(Mutex<Vec<String>>);
