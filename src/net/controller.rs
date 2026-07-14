@@ -1242,7 +1242,7 @@ mod tests {
         assert!(meta.controller_token_hash.is_some());
         drop(controller);
 
-        let resumed = SessionController::resume(&session_dir).await.unwrap();
+        let resumed = resume_after_lock_release(&session_dir).await;
 
         assert_eq!(resumed.controller_id(), controller_id);
         assert_eq!(resumed.test_resume_token(), token);
@@ -1563,7 +1563,7 @@ mod tests {
             .unwrap();
         drop(controller);
 
-        let resumed = SessionController::resume(&session_dir).await.unwrap();
+        let resumed = resume_after_lock_release(&session_dir).await;
         let restored = wait_for_terminal(&resumed, &allocated.record.id).await;
         assert_eq!(
             restored.state,
@@ -1603,7 +1603,7 @@ mod tests {
             .unwrap();
         drop(controller);
 
-        let resumed = SessionController::resume(&session_dir).await.unwrap();
+        let resumed = resume_after_lock_release(&session_dir).await;
         let restored = wait_for_terminal(&resumed, &allocated.record.id).await;
         assert_eq!(restored.id, allocated.record.id);
         assert_eq!(
@@ -1672,7 +1672,7 @@ mod tests {
         .unwrap();
         drop(controller);
 
-        let resumed = SessionController::resume(&session_dir).await.unwrap();
+        let resumed = resume_after_lock_release(&session_dir).await;
         let restored = wait_for_terminal(&resumed, operation_id).await;
         assert_eq!(
             restored.state,
@@ -1857,7 +1857,7 @@ mod tests {
         drop(remote);
         drop(controller);
 
-        let resumed = SessionController::resume(&session_dir).await.unwrap();
+        let resumed = resume_after_lock_release(&session_dir).await;
         let restored = wait_for_terminal(&resumed, operation_id).await;
         assert_eq!(
             restored.state,
@@ -1883,6 +1883,24 @@ mod tests {
         })
         .await
         .expect("background recovery must reach a terminal state")
+    }
+
+    async fn resume_after_lock_release(session_dir: &std::path::Path) -> SessionController {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match SessionController::resume(session_dir).await {
+                    Ok(controller) => break controller,
+                    Err(ControllerError::Storage(
+                        crate::net::session_store::StoreError::Locked,
+                    )) => {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(error) => panic!("session resume failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("session store lock must be released after controller drop")
     }
 
     fn assert_once_line(path: &std::path::Path) {
