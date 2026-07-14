@@ -1205,10 +1205,19 @@ mod tests {
                 })).await
             })
         };
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let running = server.session_status(Parameters(SessionIdParams {
-            session_id: connected.session_id.clone(),
-        })).await.unwrap().0;
+        let running = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let status = server.session_status(Parameters(SessionIdParams {
+                    session_id: connected.session_id.clone(),
+                })).await.unwrap().0;
+                if status.last_operation.as_ref().map(|operation| operation.state.as_str())
+                    == Some("running")
+                {
+                    break status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("operation reaches running state");
         assert_eq!(running.last_operation.as_ref().map(|operation| operation.state.as_str()), Some("running"));
         let completed = executing.await.unwrap().unwrap().0;
         let terminal = server.session_status(Parameters(SessionIdParams {
