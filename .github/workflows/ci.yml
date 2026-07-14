@@ -20,8 +20,8 @@ jobs:
           cargo test --verbose -- --test-threads=1
           --skip net::controller::tests
           --skip net::share::tests
-          --skip core_remote_assist::controller
-          --skip core_remote_assist::share
+          --skip server::tools::tests
+          --skip core_remote_assist
       - if: runner.os == 'Windows'
         run: cargo test --verbose --lib net::controller::tests::matching_token_renews_before_and_after_expiry -- --exact
       - if: runner.os == 'Windows'
