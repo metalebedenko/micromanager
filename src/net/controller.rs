@@ -1529,11 +1529,10 @@ mod tests {
         );
 
         let resumed = Arc::new(SessionRegistry::new(engineer_root.path()));
-        let (first_a, second_a, first_b) =
-            tokio::join!(resumed.get(&id_a), resumed.get(&id_a), resumed.get(&id_b),);
+        let (first_a, second_a) = tokio::join!(resumed.get(&id_a), resumed.get(&id_a));
         let first_a = first_a.unwrap();
         let second_a = second_a.unwrap();
-        let first_b = first_b.unwrap();
+        let first_b = resumed.get(&id_b).await.unwrap();
         assert_eq!(first_a.controller_id(), second_a.controller_id());
         assert_ne!(first_a.session_id().unwrap(), first_b.session_id().unwrap());
         drop(first_a);
