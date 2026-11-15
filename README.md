@@ -1,6 +1,6 @@
 # micromanager
 
-**«Руки для LLM»** — лёгкий безопасный кросс-платформенный (Windows / Linux / macOS) execution-endpoint. Один статичный бинарь: безопасно исполняет команды и файловые операции, а интеллект подключается клиентом.
+**«Руки для LLM»** — экспериментальный MCP-сервер для выполнения команд и файловых операций на Windows, Linux и macOS. Клиент подключает модель, а сервер применяет правила доступа и подтверждения владельца.
 
 > Принцип: **тонкие руки, сменный мозг.** micromanager — это не ассистент, а исполнительная поверхность под жёстким safety-гейтом. «Мозгом» может быть локальная LLM (Ollama), облачная модель (OpenAI-совместимый API), внешний MCP-клиент или другой человек.
 
@@ -10,7 +10,7 @@
 
 ## Установка (одна команда)
 
-Готовый статичный бинарь под твою ОС — без Rust и без зависимостей.
+Готовые бинарники [релиза v0.0.3](https://github.com/metalebedenko/micromanager/releases/tag/v0.0.3): **macOS Apple silicon (arm64), Linux x86_64 и Windows x86_64**. Rust для их установки не нужен. Для macOS Intel в этом релизе бинарника нет; вариант — сборка из исходников.
 
 **macOS / Linux:**
 ```bash
@@ -22,7 +22,7 @@ curl -fsSL https://raw.githubusercontent.com/metalebedenko/micromanager/main/ins
 irm https://raw.githubusercontent.com/metalebedenko/micromanager/main/install.ps1 | iex
 ```
 
-Скрипт качает бинарь из последнего [релиза](https://github.com/metalebedenko/micromanager/releases/latest) под нужную ОС/архитектуру (macOS arm64/x64, Linux x64, Windows x64), проверяет sha256 и кладёт в `~/.local/bin` (Unix) / `%LOCALAPPDATA%\micromanager\bin` (Windows).
+Скрипт качает бинарь из последнего [релиза](https://github.com/metalebedenko/micromanager/releases/latest) под нужную ОС/архитектуру (macOS arm64, Linux x64, Windows x64), проверяет sha256 и кладёт в `~/.local/bin` (Unix) / `%LOCALAPPDATA%\micromanager\bin` (Windows).
 
 **Из исходников** (любая платформа, нужен [Rust](https://rustup.rs)):
 ```bash
@@ -73,3 +73,4 @@ cargo clippy --all-targets
 ## Лицензия
 
 Двойная: [MIT](LICENSE-MIT) или [Apache-2.0](LICENSE-APACHE) — на выбор.
+
