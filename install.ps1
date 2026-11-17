@@ -27,15 +27,15 @@ try {
     $zip = Join-Path $tmp $asset
     Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
 
-    # checksum (best-effort)
-    try {
-        $sumFile = "$zip.sha256"
-        Invoke-WebRequest -Uri "$url.sha256" -OutFile $sumFile -UseBasicParsing
-        $want = (Get-Content $sumFile -Raw).Split()[0].Trim().ToLower()
-        $got  = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
-        if ($want -and ($want -ne $got)) { throw "контрольная сумма не сошлась (ожидал $want, получил $got)" }
-        Write-Host "checksum ok"
-    } catch { Write-Host "checksum пропущен" }
+    $sumFile = "$zip.sha256"
+    Invoke-WebRequest -Uri "$url.sha256" -OutFile $sumFile -UseBasicParsing
+    $sumText = (Get-Content -LiteralPath $sumFile -Raw).Trim()
+    $pattern = '\A(?<hash>[0-9a-fA-F]{64})[ \t]+\*?' + [regex]::Escape($asset) + '\z'
+    $entry = [regex]::Match($sumText, $pattern)
+    if (-not $entry.Success) { throw "некорректный файл SHA-256 для $asset" }
+    $got = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash
+    if ($got -ine $entry.Groups['hash'].Value) { throw "контрольная сумма архива не совпадает" }
+    Write-Host "SHA-256 verified"
 
     Expand-Archive -Path $zip -DestinationPath $tmp -Force
     $exe = Join-Path $tmp "$Bin.exe"

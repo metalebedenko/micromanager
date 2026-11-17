@@ -12,26 +12,7 @@ pub fn save_config(path: &Path, settings: &Settings) -> std::io::Result<()> {
     let json = serde_json::to_string_pretty(settings)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     // Конфиг может хранить API-ключ → права только владельцу (0600 на Unix).
-    write_private(path, json.as_bytes())
-}
-
-#[cfg(unix)]
-fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(data)
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    // Windows: файл в профиле пользователя; полагаемся на ACL профиля по умолчанию.
-    std::fs::write(path, data)
+    crate::net::store::write_private(path, json.as_bytes())
 }
 
 pub fn load_config(path: &Path) -> Option<Settings> {

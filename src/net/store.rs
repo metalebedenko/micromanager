@@ -17,32 +17,15 @@ pub(crate) fn peers_path() -> PathBuf {
     crate::paths::state_path("peers.json")
 }
 
-/// Записать файл атомарно и приватно: temp-файл (0600) + `rename`. Полуфайла не бывает —
-/// при краше остаётся либо старый целый, либо новый целый. Для приватных данных (ключ).
+/// Write into a private, unique file in the destination directory, then replace the target.
 pub(crate) fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    write_tmp_0600(&tmp, data)?;
-    std::fs::rename(&tmp, path)
-}
-
-#[cfg(unix)]
-fn write_tmp_0600(tmp: &Path, data: &[u8]) -> io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(tmp)?;
-    f.write_all(data)?;
-    f.sync_all()
-}
-
-#[cfg(not(unix))]
-fn write_tmp_0600(tmp: &Path, data: &[u8]) -> io::Result<()> {
-    // Windows: полагаемся на ACL профиля пользователя.
-    std::fs::write(tmp, data)
+    let directory = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let mut staged = tempfile::NamedTempFile::new_in(directory)?;
+    staged.write_all(data)?;
+    staged.as_file().sync_all()?;
+    staged.persist(path).map_err(|e| e.error)?;
+    Ok(())
 }
 
 /// Если файл существует с правами шире 0600 (Unix) — принудительно ужесточить до 0600.

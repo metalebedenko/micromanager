@@ -51,21 +51,21 @@ trap 'rm -rf "$tmp"' EXIT
 say "↓ скачиваю $asset ..."
 dl "$url" "$tmp/$asset" || err "не удалось скачать $url (релиз ещё не собран? проверь github.com/$REPO/releases)"
 
-# --- проверка контрольной суммы (best-effort) ---
-if dl "${url}.sha256" "$tmp/$asset.sha256" 2>/dev/null; then
-  if command -v shasum >/dev/null 2>&1; then
-    sum="$(shasum -a 256 "$tmp/$asset" | awk '{print $1}')"
-  elif command -v sha256sum >/dev/null 2>&1; then
-    sum="$(sha256sum "$tmp/$asset" | awk '{print $1}')"
-  else
-    sum=""
-  fi
-  if [ -n "$sum" ]; then
-    want="$(awk '{print $1}' "$tmp/$asset.sha256")"
-    [ "$sum" = "$want" ] || err "контрольная сумма не сошлась (ожидал $want, получил $sum)"
-    say "✓ checksum ок"
-  fi
+# --- проверка контрольной суммы до распаковки ---
+dl "${url}.sha256" "$tmp/$asset.sha256" || err "не удалось получить SHA-256 для $asset"
+want="$(awk -v asset="$asset" '
+  NR == 1 && NF == 2 && length($1) == 64 && $1 !~ /[^0-9a-fA-F]/ && ($2 == asset || $2 == "*" asset) { hash = tolower($1) }
+  END { if (NR != 1 || hash == "") exit 1; print hash }
+' "$tmp/$asset.sha256")" || err "некорректный файл SHA-256 для $asset"
+if command -v shasum >/dev/null 2>&1; then
+  result="$(shasum -a 256 "$tmp/$asset")" || err "не удалось вычислить SHA-256"
+elif command -v sha256sum >/dev/null 2>&1; then
+  result="$(sha256sum "$tmp/$asset")" || err "не удалось вычислить SHA-256"
+else
+  err "для проверки архива нужен shasum или sha256sum"
 fi
+[ "${result%% *}" = "$want" ] || err "контрольная сумма архива не совпадает"
+say "✓ SHA-256 проверен"
 
 # --- распаковка и установка ---
 tar -xzf "$tmp/$asset" -C "$tmp"
