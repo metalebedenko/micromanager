@@ -101,20 +101,45 @@ impl FileAudit {
             max_bytes: 5_000_000,
         }
     }
+
+    fn open_private(&self) -> std::io::Result<std::fs::File> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(&self.path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let meta = file.metadata()?;
+            if !meta.is_file() || meta.nlink() != 1 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "expected a regular private audit file"));
+            }
+            if meta.permissions().mode() & 0o777 != 0o600 {
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        Ok(file)
+    }
 }
 
 impl Audit for FileAudit {
     fn record(&self, entry: &AuditEntry) -> std::io::Result<()> {
-        if let Ok(meta) = std::fs::metadata(&self.path) {
-            if meta.len() >= self.max_bytes {
-                let _ = std::fs::rename(&self.path, self.path.with_extension("1"));
-            }
+        let mut f = self.open_private()?;
+        if f.metadata()?.len() >= self.max_bytes {
+            drop(f);
+            let _ = std::fs::rename(&self.path, self.path.with_extension("1"));
+            f = self.open_private()?;
         }
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        let line = serde_json::to_string(entry).unwrap_or_else(|_| "{}".to_string());
+        let safe = AuditEntry {
+            action: crate::tg::redact(&entry.action),
+            result: crate::tg::redact(&entry.result),
+            ..entry.clone()
+        };
+        let line = serde_json::to_string(&safe)?;
         writeln!(f, "{line}")
     }
 }

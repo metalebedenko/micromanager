@@ -2,15 +2,46 @@
 //! Raw-режим (без LLM). Перед отправкой — secret-redaction: не лить секреты в TG.
 
 use crate::audit::{Audit, AuditEntry};
+use regex::{Captures, Regex};
+use std::sync::LazyLock;
+
+// Keep the command and option names for the audit trail while masking credential values.
+static CREDENTIAL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?ix)
+        (?P<label>
+            \b(?:proxy-)?authorization[\x20\t]*:[\x20\t]*(?:bearer|basic)[\x20\t]+
+          | \bbearer[\x20\t]+
+          | [-\w.]*(?:password|passwd|api[_-]?key|access[_-]?key|token|secret|credential)[-\w.]*["']?[\x20\t]*[:=][\x20\t]*
+          | --?[-\w.]*(?:password|passwd|api[_-]?key|token|secret|credential)[-\w.]*[\x20\t]+
+        )(?:"(?:\\.|[^"\\])*"|'[^']*'|[^\s,;"'&}]+)
+      | (?P<scheme>https?://)[^/\s:@<>"']+:[^/\s@<>"']+@
+      | (?:gh[pousr]_[a-z0-9]{30,}|github_pat_[a-z0-9_]{40,}|sk-[a-z0-9_-]{20,}
+          | xox[baprs]-[a-z0-9-]{20,}|[0-9]{7,14}:[a-z0-9_-]{30,}
+          | eyJ[a-z0-9_-]{8,}\.[a-z0-9_-]{8,}\.[a-z0-9_-]{10,})
+    "#).expect("valid credential patterns")
+});
+
+pub(crate) fn contains_credential(text: &str) -> bool {
+    CREDENTIAL.is_match(text)
+}
 
 /// Замаскировать вероятные секреты в тексте ПЕРЕД отправкой в Telegram.
 /// Эвристично и намеренно «пере-маскирует» (безопаснее лишний раз скрыть). Spec §7 — известно неполно.
 pub fn redact(text: &str) -> String {
+    let masked = CREDENTIAL.replace_all(text, |parts: &Captures<'_>| {
+        if let Some(scheme) = parts.name("scheme") {
+            format!("{}***@", scheme.as_str())
+        } else {
+            format!("{}***", parts.name("label").map_or("", |label| label.as_str()))
+        }
+    });
+    let mut changed = matches!(&masked, std::borrow::Cow::Owned(_));
     let mut out: Vec<String> = Vec::new();
     let mut mask_next = false;
-    for tok in text.split_whitespace() {
+    for tok in masked.split_whitespace() {
         if mask_next {
             out.push("***".to_string());
+            changed = true;
             mask_next = false;
             continue;
         }
@@ -18,6 +49,7 @@ pub fn redact(text: &str) -> String {
         if let Some((k, _)) = tok.split_once(['=', ':']) {
             if is_secretish(k) {
                 out.push(format!("{k}=***"));
+                changed = true;
                 continue;
             }
         }
@@ -30,11 +62,12 @@ pub fn redact(text: &str) -> String {
         // длинный непрозрачный блоб (base64/hex/токен) → маскируем
         if looks_secret_blob(tok) {
             out.push("***".to_string());
+            changed = true;
             continue;
         }
         out.push(tok.to_string());
     }
-    out.join(" ")
+    if changed { out.join(" ") } else { text.to_owned() }
 }
 
 fn is_secretish(k: &str) -> bool {

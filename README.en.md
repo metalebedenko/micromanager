@@ -10,4 +10,6 @@ The downloadable [0.0.3 binaries](https://github.com/metalebedenko/micromanager/
 
 The desktop interface shows approval requests. The [architecture](ARCHITECTURE.md) describes how access limits, local settings and remote sessions fit together. The [Russian guide](README.md) covers the commands and supported release platforms.
 
+Recognised credential formats are masked in the file audit log and automatic Telegram reports. Telegram approval rejects requests containing recognisable credentials. Use local approval for these actions. On Unix, new and reopened audit logs are restricted to the file owner. Free-form command text can still contain private information. Share only a short, redacted excerpt in a public issue.
+
 [MIT licence](LICENSE-MIT) · [Apache 2.0 licence](LICENSE-APACHE)

@@ -151,8 +151,12 @@ impl TelegramConfirmer {
     }
 
     fn ask(&self, action: &Action, dangerous: bool) -> Option<Decision> {
-        let (n, rx) = self.pending.register();
         let text = describe(action);
+        if super::report::contains_credential(&text) {
+            eprintln!("[micromanager] Запрос с учётными данными требует локального подтверждения.");
+            return None;
+        }
+        let (n, rx) = self.pending.register();
         if self
             .sender
             .send_confirm(self.chat_id, &text, &n, dangerous)
