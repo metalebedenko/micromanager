@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # создание релиза + загрузка ассетов
+  contents: read
 
 jobs:
   build:
@@ -24,7 +24,7 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             asset: micromanager-macos-aarch64.tar.gz
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             asset: micromanager-macos-x86_64.tar.gz
           - os: windows-latest
@@ -43,7 +43,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build release
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: runner.os != 'Windows'
@@ -62,9 +62,50 @@ jobs:
           $h = (Get-FileHash -Algorithm SHA256 "${{ matrix.asset }}").Hash.ToLower()
           "$h  ${{ matrix.asset }}" | Out-File -Encoding ascii "${{ matrix.asset }}.sha256"
 
-      - name: Attach to GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Keep the archive and checksum for publication
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          files: |
+          name: ${{ matrix.asset }}
+          path: |
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sha256
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Collect all four builds
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify every archive before publication
+        working-directory: dist
+        shell: python
+        run: |
+          from hashlib import sha256
+          from pathlib import Path
+
+          archives = (
+              "micromanager-linux-x86_64.tar.gz",
+              "micromanager-macos-aarch64.tar.gz",
+              "micromanager-macos-x86_64.tar.gz",
+              "micromanager-windows-x86_64.zip",
+          )
+          for name in archives:
+              expected, recorded = Path(name + ".sha256").read_text(encoding="ascii").split()
+              data = Path(name).read_bytes()
+              if not data or recorded != name or sha256(data).hexdigest() != expected.lower():
+                  raise SystemExit(f"Invalid release archive or checksum for {name}")
+
+      - name: Publish the verified release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          fail_on_unmatched_files: true
+          files: dist/*

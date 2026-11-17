@@ -4,9 +4,11 @@
 
 An experimental tool that lets an AI agent work with files and commands on a computer. The owner controls which files the agent can access and can approve or decline changes. It supports Windows, Linux and macOS.
 
-## Before using a release
+## Download
 
-The downloadable [0.0.3 binaries](https://github.com/metalebedenko/micromanager/releases/tag/v0.0.3) predate the dependency updates in this source revision. The installers verify the published SHA-256 checksum before extracting an archive. To use the updated dependencies, build from the current source. Keep local credentials, peer identities and private configuration out of public issues and logs.
+[Download micromanager v0.0.4](https://github.com/metalebedenko/micromanager/releases/tag/v0.0.4) for macOS on Apple silicon (arm64) or Intel (x86_64), Windows x86_64, or Linux x86_64. The prebuilt downloads do not require Rust.
+
+Version 0.0.4 includes the dependency updates and improvements to audit logs and local credential storage. The installers verify the archive’s SHA-256 checksum before extraction. Keep credentials and private configuration out of public issues.
 
 The desktop interface shows approval requests. The [architecture](ARCHITECTURE.md) describes how access limits, local settings and remote sessions fit together. The [Russian guide](README.md) covers the commands and supported release platforms.
 

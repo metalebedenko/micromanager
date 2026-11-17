@@ -12,9 +12,9 @@
 
 ## Установка (одна команда)
 
-Бинарные файлы версии 0.0.3 собраны до обновлений зависимостей в этой версии исходников. Установщик проверяет SHA-256 опубликованного архива и останавливается, если контрольная сумма отсутствует или не совпадает. Чтобы использовать обновлённые зависимости, нужна сборка из текущих исходников.
+[Скачать micromanager v0.0.4](https://github.com/metalebedenko/micromanager/releases/tag/v0.0.4). Готовые сборки доступны для macOS на Apple silicon (arm64) и Intel (x86_64), Windows x86_64 и Linux x86_64. Rust для установки готового приложения не требуется.
 
-Готовые бинарники [релиза v0.0.3](https://github.com/metalebedenko/micromanager/releases/tag/v0.0.3): **macOS Apple silicon (arm64), Linux x86_64 и Windows x86_64**. Rust для их установки не нужен. Для macOS Intel в этом релизе бинарника нет; вариант — сборка из исходников.
+В v0.0.4 обновлены зависимости и усилена защита журналов, ключей и настроек. Установщик сверяет SHA-256 архива до распаковки.
 
 **macOS / Linux:**
 ```bash
@@ -26,7 +26,7 @@ curl -fsSL https://raw.githubusercontent.com/metalebedenko/micromanager/main/ins
 irm https://raw.githubusercontent.com/metalebedenko/micromanager/main/install.ps1 | iex
 ```
 
-Скрипт качает бинарь из последнего [релиза](https://github.com/metalebedenko/micromanager/releases/latest) под нужную ОС/архитектуру (macOS arm64, Linux x64, Windows x64), проверяет sha256 и кладёт в `~/.local/bin` (Unix) / `%LOCALAPPDATA%\micromanager\bin` (Windows).
+Скрипт качает бинарь из последнего [релиза](https://github.com/metalebedenko/micromanager/releases/latest) под нужную ОС/архитектуру (macOS arm64/x64, Linux x64, Windows x64), проверяет sha256 и кладёт в `~/.local/bin` (Unix) / `%LOCALAPPDATA%\micromanager\bin` (Windows).
 
 **Из исходников** (любая платформа, нужен [Rust](https://rustup.rs)):
 ```bash
