@@ -2,7 +2,7 @@
 
 [По-русски](README.md)
 
-An experimental tool that lets an AI agent work with files and commands on a computer. The owner controls which files the agent can access and can approve or decline changes. It supports Windows, Linux and macOS.
+micromanager is an experimental tool for macOS, Windows and Linux. You choose which files an AI agent can access. In the terminal, you can see the change it wants to make or the command it wants to run, then approve or decline the request.
 
 ## Download
 
